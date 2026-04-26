@@ -151,7 +151,8 @@ MCP2515 driver.
 ```
 cd host
 sudo ./setup-can.sh
-./run-ota.sh                       # builds fixture, pushes via UDS
+./run-ota.sh                       # default fixture (~1.5 KB)
+./run-ota.sh --reps 21845          # 1 MB plaintext fixture
 ```
 
 Expected output:
@@ -176,35 +177,54 @@ expected sha256: 0d0c46f9...
 OK — SUIT-over-UDS pipeline verified end-to-end.
 ```
 
-App-level framing the host script applies before pushing:
+Flow (host's perspective):
+
+1. `RoutineControl(start, 0xFF00 eraseMemory)` — kicks off background
+   erase of the inactive flash slot. Device drives one 4 KB sector
+   per main-loop iteration so CAN polling stays alive.
+2. Poll `ReadDID(0xF200)` until state == `'R'` (ready).
+3. `RequestDownload(size)` — host announces total framed size.
+4. `TransferData` chunks of 256 bytes carrying
+   `[4 B env_len][envelope][payload]` concatenated. Device parses
+   bytes through a state machine — `NEED_HEADER` (4 B), 
+   `NEED_ENVELOPE` (buffered into a 4 KB RAM array), `NEED_PAYLOAD`
+   (streamed through the pipeline below).
+5. `TransferExit` — finalize; state goes `V` (validating) → `K`/`X`.
+6. `ReadDID(0xF201)` — 32-byte SHA-256 of the recovered plaintext.
+
+Streaming pipeline in `NEED_PAYLOAD` (per chunk):
 
 ```
-+----------------+-----------------+-------------------+
-| env_len (4 B   | envelope        | payload           |
-|  LE uint32)    |  (manifest+sig) | (encrypted+zstd)  |
-+----------------+-----------------+-------------------+
+ciphertext bytes
+  → psa_decryptor_update          AES-128-GCM, A128KW-unwrapped CEK
+  → sumo_decompressor_update      zstd, windowLog 10
+  → 256-byte page buffer
+  → flash_range_program           inactive slot, page-by-page
+  → psa_hash_update               running SHA-256
 ```
 
-Device state machine walks bytes through three states —
-`NEED_HEADER` (parse 4 B env_len), `NEED_ENVELOPE` (buffer N bytes
-into a 4 KB RAM staging area), `NEED_PAYLOAD` (stream to inactive
-flash slot via `platform_rp2350.c`'s page-by-page write_fn). At
-TransferExit:
+Plaintext **never accumulates in RAM** — it lands directly in the
+inactive flash slot, sized for real firmware. `TransferExit` flushes
+the partial page, `psa_decryptor_finalize` verifies the GCM tag,
+`sumo_decompressor_finalize` verifies the zstd frame ended cleanly,
+and `psa_hash_finish` emits the final SHA-256 to DID `0xF201` for
+host cross-check.
 
-1. `sumo_validate_envelope(...)` — ECDSA-P256 manifest signature.
-2. `sumo_manifest_encryption_info(...)` — pulls the `COSE_Encrypt`
-   bytes out of the validated manifest (libsumo accessor added in
-   the same commit).
-3. `psa_decryptor_create + update + finalize` — reads ciphertext
-   directly from XIP-mapped inactive slot, AES-128-GCM streaming.
-4. `sumo_decompressor_*` — zstd into a 2 KB RAM plaintext buffer.
-5. `psa_hash_compute(SHA_256, ...)` — exposed at DID `0xF201`.
+Why `max_block=256` (not 1024 or larger): one ISO-TP message at
+1024 bytes = 1 FF + 146 CFs ≈ 36 ms on the wire at 500 kbit.
+Single-core polled drain (`mcp2515_receive` in the main loop) can
+keep up with that burst most of the time but loses the occasional
+CF, ISO-TP aborts on the resulting SN mismatch, and the host times
+out. 256-byte chunks are 38-frame bursts — comfortably within the
+drain rate. Dual-core split (CAN/ISO-TP on Core 1 with a SPSC
+queue to Core 0) would unlock larger blocks; tracked as a 4c
+follow-up if higher OTA throughput becomes useful.
 
 Status DIDs the host polls:
 
 | DID    | Returns                          |
 |--------|----------------------------------|
-| 0xF200 | one ASCII byte: state name (`I H E P V K X` for idle/header/env/payload/validating/ok/failed) |
+| 0xF200 | one ASCII byte: state name (`I P R H E D V K X` for idle/preparing/ready/header/env/downloading/validating/ok/failed) |
 | 0xF201 | 32-byte SHA-256 of plaintext (zeros until OK) |
 | 0xF202 | uint32 LE bytes-consumed (live progress)  |
 
@@ -212,14 +232,15 @@ Status DIDs the host polls:
 
 - **A/B activate + reset** — bootrom partition picker integration;
   4c.
-- **Plaintext-to-flash for real-firmware sizes** — 4b's plaintext
-  lands in a 2 KB RAM buffer; works for the ~1.6 KB fixture but won't
-  for MB-scale firmware. Fixed in 4c with proper bootloader handoff.
 - **SecurityAccess** — RequestDownload / TransferData / TransferExit
   registrations in `main.c` re-register the lib's defaults with
   `requires_security=false` so 4b focuses on the OTA pipeline shape.
   Production wants the lib's default `requires_security=true` plus a
   real seed/key challenge — 4c.
+- **Larger TransferData blocks (1024 / 4096 B)** — needs the CAN/
+  ISO-TP loop on Core 1 with a SPSC queue feeding Core 0. The
+  RP2040 reference's dual-core split is the existing pattern;
+  follow-up for higher OTA throughput.
 - **Native CAN-FD via PIO** — if/when we want to drop the MCP2515 in
   favour of pure PIO, the `can_hw.c` shim is the only file that
   changes.

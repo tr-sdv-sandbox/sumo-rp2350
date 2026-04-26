@@ -96,6 +96,20 @@ sumo_platform_ops_t *sumo_rp2350_platform_ops(sumo_rp2350_t *r);
  */
 int sumo_rp2350_active_slot(sumo_rp2350_t *r);
 
+/**
+ * Flash-region geometry of the *inactive* slot (the one OTA writes
+ * land in). Offsets are XIP-relative — pass to `flash_range_erase` /
+ * `flash_range_program` directly, or add `XIP_BASE` for a memory-
+ * mapped read pointer.
+ *
+ * Exposed so an OTA flow that wants per-sector erase + per-page
+ * program (rather than the orchestrator's "erase whole slot at
+ * offset 0" semantics in `sumo_platform_ops_t::write`) can address
+ * the right region without parsing the libsumo configs again.
+ */
+uint32_t sumo_rp2350_inactive_offset(sumo_rp2350_t *r);
+uint32_t sumo_rp2350_inactive_size  (sumo_rp2350_t *r);
+
 #ifdef __cplusplus
 }
 #endif

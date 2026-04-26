@@ -21,4 +21,12 @@
 #define CAN_USE_EXT_ID       1
 #define CAN_BAUDRATE_KBPS    500
 
+/* ── MCP2515 SW FIFO depths ──────────────────────────────────────
+ * Default 32 isn't enough for the CF burst of a 1 KB UDS
+ * TransferData message (1 FF + 146 CFs). 256 holds ~4 KB worth of
+ * frames — plenty for a full ISO-TP message at the host's max
+ * block size of 1024. */
+#define MCP2515_RX_FIFO_DEPTH 256
+#define MCP2515_TX_FIFO_DEPTH 64
+
 #endif /* APP_CONFIG_H */

@@ -349,3 +349,15 @@ int sumo_rp2350_active_slot(sumo_rp2350_t *r)
     if (!r) return -1;
     return active_slot(r);
 }
+
+uint32_t sumo_rp2350_inactive_offset(sumo_rp2350_t *r)
+{
+    if (!r) return 0;
+    return inactive_offset(&r->cfg, active_slot(r));
+}
+
+uint32_t sumo_rp2350_inactive_size(sumo_rp2350_t *r)
+{
+    if (!r) return 0;
+    return inactive_size(&r->cfg, active_slot(r));
+}

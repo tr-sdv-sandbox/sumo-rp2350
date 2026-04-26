@@ -48,16 +48,20 @@ SUMO_TOOL = (HOST_DIR.parent.parent.parent.parent
 
 # ── Fixture build ──────────────────────────────────────────────────
 
-FIXTURE_PLAINTEXT = (b"Sumo RP2350 checkpoint 4b - SUIT-over-UDS test. " * 32)
-# 50 chars * 32 = 1600 bytes
+FIXTURE_BLOCK = b"Sumo RP2350 checkpoint 4b - SUIT-over-UDS test. "  # 48 B
 
 
-def build_fixture(verbose: bool = False) -> tuple[pathlib.Path, pathlib.Path]:
+def make_plaintext(reps: int) -> bytes:
+    return FIXTURE_BLOCK * reps
+
+
+def build_fixture(plaintext: bytes,
+                  verbose: bool = False) -> tuple[pathlib.Path, pathlib.Path]:
     """Run sumo-tool to produce envelope + external payload. Returns
     (envelope_path, payload_path)."""
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     fw_bin = WORK_DIR / "fw.bin"
-    fw_bin.write_bytes(FIXTURE_PLAINTEXT)
+    fw_bin.write_bytes(plaintext)
 
     envelope = WORK_DIR / "c4b.suit"
     payload = WORK_DIR / "fw.enc"
@@ -141,12 +145,18 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("iface", nargs="?", default=None,
                     help="SocketCAN interface (auto-pick if omitted)")
+    ap.add_argument("--reps", type=int, default=32,
+                    help="fixture plaintext = FIXTURE_BLOCK * reps "
+                         "(48 B each). Default 32 (1.5 KB). "
+                         "--reps 21845 ≈ 1 MB.")
     ap.add_argument("--no-build", action="store_true",
                     help="reuse fixture in /tmp/sumo-rp2350-4b/")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     iface = args.iface or autopick_can_iface()
+
+    plaintext = make_plaintext(args.reps)
 
     # Build the fixture (or reuse).
     if args.no_build:
@@ -156,8 +166,8 @@ def main() -> int:
             sys.exit(f"--no-build set but {envelope} / {payload} missing")
         print(f"reusing fixture from {WORK_DIR}")
     else:
-        print("building fixture envelope (sumo-tool build) ...")
-        envelope, payload = build_fixture(args.verbose)
+        print(f"building fixture envelope ({len(plaintext)} B plaintext) ...")
+        envelope, payload = build_fixture(plaintext, args.verbose)
         print(f"  envelope: {envelope.stat().st_size} B  ({envelope})")
         print(f"  payload:  {payload.stat().st_size} B  ({payload})")
 
@@ -167,7 +177,7 @@ def main() -> int:
     print(f"framed: 4 + {len(env_bytes)} + {len(pl_bytes)} = "
           f"{len(framed)} bytes")
 
-    expected_sha = hashlib.sha256(FIXTURE_PLAINTEXT).hexdigest()
+    expected_sha = hashlib.sha256(plaintext).hexdigest()
     print(f"expected plaintext SHA-256: {expected_sha}")
 
     udsoncan.setup_logging()
@@ -179,9 +189,12 @@ def main() -> int:
         0xF202: LeUint32(),
     }
     config["use_server_timing"] = False
-    config["request_timeout"] = 5.0
-    config["p2_timeout"] = 2.5
-    config["p2_star_timeout"] = 5.0
+    # Generous wall-clock budgets — TransferExit can take seconds on
+    # 1 MB images (final tag verify + flush + hash); RoutineControl
+    # responses come back fast since the erase is in the background.
+    config["request_timeout"] = 60.0
+    config["p2_timeout"] = 30.0
+    config["p2_star_timeout"] = 60.0
 
     conn = make_connection(iface)
     print(f"using {iface}\n")
@@ -191,6 +204,27 @@ def main() -> int:
         r = client.change_session(
             DiagnosticSessionControl.Session.programmingSession)
         print(f"  ← session_echo={r.service_data.session_echo}")
+
+        # ── 1. RoutineControl(start, 0xFF00 eraseMemory) ──
+        # Kicks off a background erase of the inactive flash slot.
+        # The device drives one 4 KB sector erase per main-loop
+        # iteration so CAN polling stays responsive. Returns
+        # immediately; we then poll DID 0xF200 until state == 'R'.
+        print("\n=== RoutineControl(start, 0xFF00 eraseMemory) ===")
+        client.start_routine(0xFF00)
+        print("  ← started")
+
+        print("\n=== polling DID 0xF200 until 'R' (ready) ===")
+        t_start = time.monotonic()
+        while True:
+            r = client.read_data_by_identifier(0xF200)
+            st = r.service_data.values[0xF200]
+            if st == "R":
+                print(f"  state='R' (ready) after {time.monotonic()-t_start:.2f} s")
+                break
+            if st == "X":
+                sys.exit("device reported 'X' (failed) during prepare")
+            time.sleep(0.5)
 
         print(f"\n=== RequestDownload(addr=0, size={len(framed)}) ===")
         r = client.request_download(

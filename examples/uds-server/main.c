@@ -6,30 +6,38 @@
  *   0x10  DiagSessionControl   (default / programming / extended)
  *   0x11  ECUReset             (hardReset → watchdog_reboot)
  *   0x22  ReadDID              (0xF187 0xF195 0xF18C; 0xF200/F201/F202 dynamic)
- *   0x34  RequestDownload      (begins OTA — accepts size, allocates staging)
+ *   0x31  RoutineControl       (0xFF00 = eraseMemory → erase inactive slot)
+ *   0x34  RequestDownload      (begins OTA — accepts size, validates state)
  *   0x36  TransferData         (state machine: header → envelope → payload)
- *   0x37  TransferExit         (validate + decrypt + decompress + sha256)
+ *   0x37  TransferExit         (finalize stream + sha256)
  *   0x3E  TesterPresent        (with suppress-positive-response)
  *
- * Hybrid staging:
- *   - Envelope (manifest + COSE_Sign1) buffers in a 4 KB RAM array.
- *   - Encrypted+compressed payload streams to the inactive flash slot
- *     via platform_rp2350.c's write_fn (offset=0 erases, page-by-page
- *     thereafter).
- *   - On TransferExit:
- *        sumo_validate_envelope(...)                      [signature]
- *        sumo_manifest_encryption_info(...)               [COSE_Encrypt bytes]
- *        psa_decryptor_create + stream-decrypt while reading
- *          ciphertext from XIP-mapped inactive slot
- *        sumo_decompressor_* on-the-fly into a 2 KB RAM plaintext buf
- *        psa_hash_compute(SHA-256, ...) on the plaintext
+ * Hybrid streaming OTA flow (request order from host):
+ *   1. RoutineControl(start, 0xFF00) — kicks off background erase of
+ *      the inactive flash slot, sector-at-a-time in the main loop so
+ *      CAN polling stays alive. State goes I → P (preparing).
+ *   2. ReadDID(0xF200) loop until state == 'R' (ready).
+ *   3. RequestDownload(size) — host announces total framed size.
+ *   4. TransferData chunks carrying [4 B env_len][envelope][payload],
+ *      streamed through:
+ *           ciphertext → psa_decryptor_update
+ *                      → sumo_decompressor_update (plaintext)
+ *                      → flash_range_program (inactive slot, page-by-page)
+ *                      → psa_hash_update (running SHA-256)
+ *      Plaintext NEVER buffers in RAM; the inactive slot ends up
+ *      holding the final firmware ready for activation in 4c.
+ *   5. TransferExit — drain decryptor (verifies GCM tag), drain
+ *      decompressor (verifies frame end), flush partial page, finish
+ *      hash → 0xF201.
+ *   6. ReadDID(0xF200) until 'K' (ok) or 'X' (failed).
+ *   7. ReadDID(0xF201) — 32-byte SHA-256 of plaintext for cross-check.
  *
- * Status DIDs for the host to poll:
- *   0xF200  one ASCII byte: state name (I/H/E/P/V/K/X)
+ * Status DIDs:
+ *   0xF200  one ASCII byte: I/P/R/H/E/D/V/K/X
+ *           idle / preparing / ready / header / envelope / downloading /
+ *           validating / ok / failed
  *   0xF201  32-byte SHA-256 of recovered plaintext (zeros until OK)
  *   0xF202  uint32 LE bytes-consumed (live progress)
- *
- * No A/B activate or reset — those land in 4c.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -46,9 +54,11 @@
 #include "uds/uds_server.h"
 #include "uds/uds_session.h"
 #include "uds/uds_callbacks.h"
+#include "uds/uds_types.h"
 #include "isotp/isotp.h"
 #include "uds_tiny/can_hw.h"
 #include "store/did_store.h"
+#include "mcp2515.h"
 
 #include "sumo/validator.h"
 #include "sumo/decompressor.h"
@@ -101,9 +111,9 @@ static bool isotp_tx_cb(const can_frame_t *f, void *user) {
     return can_hw_send(f);
 }
 
-/* ── SUIT trust anchor + KEK (must match the host signing key /
- *    devkey.cose used by ota.py to build the fixture envelope). The
- *    same constants are used by examples/validate. */
+/* ── SUIT trust anchor + KEK (must match sign.key / devkey.cose used
+ *    by ota.py to build the fixture). Same constants as
+ *    examples/validate. */
 
 static const uint8_t kTrustAnchor[] = {
     0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20, 0x2e, 0x72,
@@ -120,10 +130,7 @@ static const uint8_t kKek[16] = {
     0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
 };
 
-/* ── Flash layout (matches examples/minimal). 4 MB Waveshare board:
- *    slot A at  0x100000 (1 MB)
- *    slot B at  0x200000 (1 MB)
- *    fs (kv) at 0x3F0000 (16 KB) */
+/* ── Flash layout (matches examples/minimal). 4 MB Waveshare board. */
 static const sumo_rp2350_config_t kFlashCfg = {
     .fs_offset     = 0x003F0000,
     .fs_size       = 0x00004000,
@@ -131,22 +138,23 @@ static const sumo_rp2350_config_t kFlashCfg = {
     .slot_a_size   = 0x00100000,
     .slot_b_offset = 0x00200000,
     .slot_b_size   = 0x00100000,
-    .fetch_fn      = NULL,        /* not used in 4b */
+    .fetch_fn      = NULL,
     .fetch_ctx     = NULL,
 };
 
 static sumo_validator_t   *s_validator;
 static sumo_rp2350_t      *s_platform;
-static sumo_platform_ops_t *s_pops;
 
 /* ── OTA state machine ───────────────────────────────────────────── */
 
-#define ENV_BUF_CAP    4096       /* envelope RAM staging cap */
-#define PT_BUF_CAP     2048       /* plaintext RAM staging cap (4b only) */
-#define PAGE_SIZE      256        /* matches FLASH_PAGE_SIZE */
+#define ENV_BUF_CAP        4096        /* envelope RAM staging cap */
+#define DECRYPT_SCRATCH    256         /* per-chunk decrypt output */
+#define PAGE_SIZE          FLASH_PAGE_SIZE
 
 typedef enum {
     OTA_IDLE = 0,
+    OTA_PREPARING,        /* erasing inactive slot in main loop */
+    OTA_READY,            /* erase complete, awaiting RequestDownload */
     OTA_NEED_HEADER,
     OTA_NEED_ENVELOPE,
     OTA_NEED_PAYLOAD,
@@ -155,45 +163,174 @@ typedef enum {
     OTA_FAILED,
 } ota_state_t;
 
-static ota_state_t s_ota_state;
-static const char  s_ota_state_chars[] = "IHEPVKX";
+/* Indexed by ota_state_t for the 0xF200 DID. */
+static const char s_state_chars[] = "IPRHEDVKX";
 
-static uint32_t s_ota_total;        /* declared in RequestDownload */
-static uint32_t s_ota_consumed;     /* running count of stream bytes */
+static volatile ota_state_t s_ota_state;
+
+/* Erase progress (only used while OTA_PREPARING). */
+static uint32_t s_prepare_offset;
+
+/* Download progress. */
+static uint32_t s_ota_total;          /* total framed bytes from RequestDownload */
+static uint32_t s_ota_consumed;
 static uint8_t  s_hdr_buf[4];
 static uint8_t  s_hdr_filled;
 static uint32_t s_env_len;
 static uint8_t  s_env_buf[ENV_BUF_CAP];
 static uint32_t s_env_filled;
-static uint32_t s_payload_len;
-static uint32_t s_payload_offset;   /* into inactive flash slot */
-static uint8_t  s_page_buf[PAGE_SIZE];
-static uint32_t s_page_filled;
+static uint32_t s_payload_len;        /* total ciphertext bytes expected */
+static uint32_t s_payload_consumed;   /* ciphertext bytes seen so far */
 
-static uint8_t  s_pt_sha256[32];
-static uint32_t s_pt_total;
+/* Streaming pipeline state — created on env→payload transition,
+ * destroyed on TransferExit / OTA_FAILED. */
+static psa_decryptor_t       *s_dec;
+static sumo_decompressor_t   *s_zd;
+static psa_hash_operation_t   s_hash_op = PSA_HASH_OPERATION_INIT;
+static uint32_t               s_pt_written;     /* plaintext bytes flashed */
+static uint32_t               s_flash_offset;   /* into inactive slot */
+static uint8_t                s_page_buf[PAGE_SIZE];
+static uint32_t               s_page_filled;
+
+static uint8_t                s_pt_sha256[32];
+
+static void ota_pipeline_free(void) {
+    if (s_dec) { psa_decryptor_free(s_dec);  s_dec = NULL; }
+    if (s_zd)  { sumo_decompressor_free(s_zd); s_zd = NULL; }
+    psa_hash_abort(&s_hash_op);
+}
 
 static void ota_reset(void) {
+    ota_pipeline_free();
     s_ota_state = OTA_IDLE;
+    s_prepare_offset = 0;
     s_ota_total = s_ota_consumed = 0;
     s_hdr_filled = 0;
     s_env_len = s_env_filled = 0;
-    s_payload_len = s_payload_offset = 0;
+    s_payload_len = s_payload_consumed = 0;
+    s_pt_written = s_flash_offset = 0;
     s_page_filled = 0;
     memset(s_pt_sha256, 0, sizeof(s_pt_sha256));
-    s_pt_total = 0;
 }
 
-/* Flush the page buffer into flash at s_payload_offset. The platform
- * write op pads partial pages to FLASH_PAGE_SIZE with 0xFF, so a tail
- * flush at TransferExit time is fine. */
-static int flush_page(void) {
+/* ── Flash helpers (we manage erase ourselves; plat_write would erase
+ *      the whole slot at offset=0 which blacks out CAN for ~6 s on a
+ *      1 MB image). */
+
+static void flash_program_page(uint32_t offset,
+                               const uint8_t *data, size_t len) {
+    uint32_t base = sumo_rp2350_inactive_offset(s_platform);
+    uint32_t saved = save_and_disable_interrupts();
+    if (len % PAGE_SIZE) {
+        /* Pad partial tail to PAGE_SIZE with 0xFF. */
+        uint8_t page[PAGE_SIZE];
+        memset(page, 0xFF, PAGE_SIZE);
+        memcpy(page, data, len);
+        flash_range_program(base + offset, page, PAGE_SIZE);
+    } else {
+        flash_range_program(base + offset, data, len);
+    }
+    restore_interrupts(saved);
+}
+
+static int flush_page_to_flash(void) {
     if (s_page_filled == 0) return 0;
-    int rc = s_pops->write(NULL, 0, s_payload_offset,
-                           s_page_buf, s_page_filled, s_pops->user_ctx);
-    if (rc != 0) return rc;
-    s_payload_offset += s_page_filled;
+    flash_program_page(s_flash_offset, s_page_buf, s_page_filled);
+    s_flash_offset += s_page_filled;
+    s_pt_written  += s_page_filled;
+    s_page_filled  = 0;
+    return 0;
+}
+
+/* ── Streaming pipeline: ciphertext → decrypt → decompress → flash + hash */
+
+static int begin_payload_phase(void) {
+    sumo_manifest_t *m = NULL;
+    int rc = sumo_validate_envelope(s_validator, s_env_buf, s_env_filled,
+                                     0, &m);
+    if (rc != 0) {
+        printf("  validate FAILED rc=%d\n", rc);
+        return -1;
+    }
+    printf("  validate OK seq=%llu components=%zu\n",
+           (unsigned long long)sumo_manifest_sequence_number(m),
+           sumo_manifest_component_count(m));
+
+    const uint8_t *enc_info; size_t enc_info_len;
+    if (sumo_manifest_encryption_info(m, 0, &enc_info, &enc_info_len) != 0) {
+        printf("  no encryption_info on component 0\n");
+        sumo_manifest_free(m);
+        return -1;
+    }
+
+    s_dec = psa_decryptor_create(enc_info, enc_info_len, kKek, sizeof(kKek));
+    sumo_manifest_free(m);
+    if (!s_dec) { printf("  psa_decryptor_create FAILED\n"); return -1; }
+
+    s_zd = sumo_decompressor_create();
+    if (!s_zd) { printf("  decompressor_create FAILED\n");
+                 psa_decryptor_free(s_dec); s_dec = NULL; return -1; }
+
+    s_hash_op = (psa_hash_operation_t)PSA_HASH_OPERATION_INIT;
+    if (psa_hash_setup(&s_hash_op, PSA_ALG_SHA_256) != PSA_SUCCESS) {
+        printf("  psa_hash_setup FAILED\n");
+        ota_pipeline_free();
+        return -1;
+    }
+
+    s_pt_written = s_flash_offset = 0;
     s_page_filled = 0;
+    return 0;
+}
+
+/* Push `n` bytes of decrypted (still-compressed) output through the
+ * decompressor → page buffer → flash + hash. Loops to drain all input
+ * and any output zstd has buffered. */
+static int pump_decompressed(const uint8_t *p, size_t n) {
+    while (n > 0) {
+        size_t in_step = n;
+        size_t out_cap = PAGE_SIZE - s_page_filled;
+        if (out_cap == 0) {
+            if (flush_page_to_flash() != 0) return -1;
+            out_cap = PAGE_SIZE;
+        }
+        if (sumo_decompressor_update(s_zd, p, &in_step,
+                                      s_page_buf + s_page_filled,
+                                      &out_cap) != 0)
+            return -1;
+        if (out_cap > 0) {
+            psa_hash_update(&s_hash_op, s_page_buf + s_page_filled, out_cap);
+            s_page_filled += out_cap;
+        }
+        p += in_step;
+        n -= in_step;
+        if (in_step == 0 && out_cap == 0) break;
+    }
+    /* Drain any output zstd has buffered after consuming our input. */
+    for (;;) {
+        size_t in_step = 0;
+        size_t out_cap = PAGE_SIZE - s_page_filled;
+        if (out_cap == 0) {
+            if (flush_page_to_flash() != 0) return -1;
+            out_cap = PAGE_SIZE;
+        }
+        if (sumo_decompressor_update(s_zd, NULL, &in_step,
+                                      s_page_buf + s_page_filled, &out_cap) != 0)
+            return -1;
+        if (out_cap == 0) break;
+        psa_hash_update(&s_hash_op, s_page_buf + s_page_filled, out_cap);
+        s_page_filled += out_cap;
+    }
+    return 0;
+}
+
+static int feed_ciphertext(const uint8_t *data, uint16_t len) {
+    uint8_t  decrypted[DECRYPT_SCRATCH];
+    size_t   decrypted_len = sizeof(decrypted);
+    if (psa_decryptor_update(s_dec, data, len, decrypted, &decrypted_len) != 0)
+        return -1;
+    if (decrypted_len > 0)
+        return pump_decompressed(decrypted, decrypted_len);
     return 0;
 }
 
@@ -203,49 +340,64 @@ static bool ota_request_cb(uint32_t addr, uint32_t size, uint8_t fmt,
                            const uds_request_t *req, uds_response_t *resp) {
     (void)addr; (void)fmt; (void)req;
 
-    /* Refuse if a transfer is already in flight. */
-    if (s_ota_state != OTA_IDLE && s_ota_state != OTA_OK &&
-        s_ota_state != OTA_FAILED) {
+    /* Strict precondition: must have been prepared (slot erased). */
+    if (s_ota_state != OTA_READY) {
         resp->len = 2;
-        resp->data[0] = 0x7F;       /* negative response */
+        resp->data[0] = 0x7F;
         resp->data[1] = 0x22;       /* conditionsNotCorrect */
         return false;
     }
 
-    /* Total = 4 (env_len) + envelope + payload. Envelope must fit in
-     * RAM staging; payload size capped by inactive slot size. */
-    if (size < 4 + 1 + 1 ||
-        size > 4 + ENV_BUF_CAP + kFlashCfg.slot_a_size) {
+    uint32_t slot_size = sumo_rp2350_inactive_size(s_platform);
+    if (size < 4 + 1 + 1 || size > 4 + ENV_BUF_CAP + slot_size) {
         resp->len = 2;
         resp->data[0] = 0x7F;
         resp->data[1] = 0x31;       /* requestOutOfRange */
         return false;
     }
 
-    ota_reset();
-    s_ota_state = OTA_NEED_HEADER;
-    s_ota_total = size;
+    s_ota_state    = OTA_NEED_HEADER;
+    s_ota_total    = size;
+    s_ota_consumed = 0;
+    s_hdr_filled   = 0;
+    s_env_filled   = 0;
+    s_payload_consumed = 0;
 
     printf("OTA RequestDownload: %u bytes total\n", (unsigned)size);
     fflush(stdout);
 
-    /* Positive response: max-block-len-format byte + 2-byte max block.
-     * lib/uds wants us to fill resp ourselves for app-managed
-     * transfers. Format byte 0x20 = "max block length is 2 bytes". */
     resp->len = 4;
-    resp->data[0] = 0x74;           /* RequestDownload positive resp */
+    resp->data[0] = 0x74;
     resp->data[1] = 0x20;
-    resp->data[2] = 0x04;           /* max block length 0x0400 = 1024 */
+    /* Max block length 0x0100 = 256 bytes per TransferData chunk.
+     * One ISO-TP message = 1 FF + ~37 CFs = ~38 frames. Comfortably
+     * within the 256-deep MCP2515 SW RX FIFO and well under what the
+     * main loop can drain between bursts. Larger blocks (e.g. 1024)
+     * empirically lose CFs at our single-core polled drain rate. */
+    resp->data[2] = 0x01;
     resp->data[3] = 0x00;
     return true;
 }
 
 static bool ota_data_cb(const uint8_t *data, uint16_t len, uint8_t seq,
                         const uds_request_t *req, uds_response_t *resp) {
-    (void)seq; (void)req;
+    (void)req;
 
-    if (s_ota_state == OTA_IDLE || s_ota_state == OTA_VALIDATING ||
-        s_ota_state == OTA_OK   || s_ota_state == OTA_FAILED) {
+    /* Periodic progress only — printf to USB-CDC is ~ms-scale and
+     * would starve the CAN drain loop if we logged every chunk. */
+    if (seq <= 3 || (seq & 0x1F) == 0) {
+        uint32_t txd = 0, rxd = 0;
+        mcp2515_get_drops(&txd, &rxd);
+        printf("  ota_data: seq=%u len=%u state=%c "
+               "consumed=%u/%u rx_drops=%u\n",
+               seq, len, s_state_chars[s_ota_state],
+               (unsigned)s_ota_consumed, (unsigned)s_ota_total,
+               (unsigned)rxd);
+        fflush(stdout);
+    }
+
+    if (s_ota_state != OTA_NEED_HEADER && s_ota_state != OTA_NEED_ENVELOPE &&
+        s_ota_state != OTA_NEED_PAYLOAD) {
         resp->len = 2;
         resp->data[0] = 0x7F;
         resp->data[1] = 0x24;       /* requestSequenceError */
@@ -254,7 +406,6 @@ static bool ota_data_cb(const uint8_t *data, uint16_t len, uint8_t seq,
 
     while (len > 0) {
         uint16_t step = 0;
-
         switch (s_ota_state) {
         case OTA_NEED_HEADER: {
             uint16_t want = 4 - s_hdr_filled;
@@ -269,17 +420,13 @@ static bool ota_data_cb(const uint8_t *data, uint16_t len, uint8_t seq,
                 if (s_env_len == 0 || s_env_len > ENV_BUF_CAP ||
                     4 + s_env_len > s_ota_total) {
                     s_ota_state = OTA_FAILED;
-                    resp->len = 2;
-                    resp->data[0] = 0x7F;
-                    resp->data[1] = 0x31;  /* requestOutOfRange */
+                    resp->len = 2; resp->data[0] = 0x7F; resp->data[1] = 0x31;
                     return false;
                 }
                 s_payload_len = s_ota_total - 4 - s_env_len;
-                if (s_payload_len > kFlashCfg.slot_a_size) {
+                if (s_payload_len > sumo_rp2350_inactive_size(s_platform)) {
                     s_ota_state = OTA_FAILED;
-                    resp->len = 2;
-                    resp->data[0] = 0x7F;
-                    resp->data[1] = 0x31;
+                    resp->len = 2; resp->data[0] = 0x7F; resp->data[1] = 0x31;
                     return false;
                 }
                 s_ota_state = OTA_NEED_ENVELOPE;
@@ -296,31 +443,31 @@ static bool ota_data_cb(const uint8_t *data, uint16_t len, uint8_t seq,
             memcpy(s_env_buf + s_env_filled, data, step);
             s_env_filled += step;
             if (s_env_filled == s_env_len) {
+                /* Validate now, set up the streaming pipeline. */
+                if (begin_payload_phase() != 0) {
+                    s_ota_state = OTA_FAILED;
+                    resp->len = 2; resp->data[0] = 0x7F; resp->data[1] = 0x24;
+                    return false;
+                }
                 s_ota_state = OTA_NEED_PAYLOAD;
             }
             break;
         }
 
         case OTA_NEED_PAYLOAD: {
-            /* Append into page buf; flush full pages to flash. */
-            uint16_t want = PAGE_SIZE - s_page_filled;
+            uint16_t want = s_payload_len - s_payload_consumed;
             step = (len < want) ? len : want;
-            memcpy(s_page_buf + s_page_filled, data, step);
-            s_page_filled += step;
-            if (s_page_filled == PAGE_SIZE) {
-                if (flush_page() != 0) {
-                    s_ota_state = OTA_FAILED;
-                    resp->len = 2;
-                    resp->data[0] = 0x7F;
-                    resp->data[1] = 0x72;   /* generalProgrammingFailure */
-                    return false;
-                }
+            if (feed_ciphertext(data, step) != 0) {
+                s_ota_state = OTA_FAILED;
+                ota_pipeline_free();
+                resp->len = 2; resp->data[0] = 0x7F; resp->data[1] = 0x72;
+                return false;
             }
+            s_payload_consumed += step;
             break;
         }
 
         default:
-            /* not reachable given the entry guard */
             return false;
         }
 
@@ -329,129 +476,43 @@ static bool ota_data_cb(const uint8_t *data, uint16_t len, uint8_t seq,
         s_ota_consumed += step;
     }
 
-    /* Positive response — empty data, just SID + 0x40 + seq counter
-     * (lib/uds fills the seq for us). */
     resp->len = 2;
-    resp->data[0] = 0x76;            /* TransferData positive resp */
+    resp->data[0] = 0x76;
     resp->data[1] = seq;
     return true;
 }
 
-/* ── TransferExit pipeline ───────────────────────────────────────── */
-
-static int run_pipeline(void) {
-    /* 1. Validate envelope. */
-    sumo_manifest_t *m = NULL;
-    int rc = sumo_validate_envelope(s_validator, s_env_buf, s_env_filled,
-                                     0, &m);
-    if (rc != 0) {
-        printf("  validate FAILED rc=%d\n", rc);
+static int finalize_pipeline(void) {
+    /* Drain decryptor (verifies GCM tag). Output is final plaintext-
+     * compressed bytes that hadn't been emitted yet. */
+    uint8_t  tail[16];
+    size_t   tail_len = sizeof(tail);
+    if (psa_decryptor_finalize(s_dec, tail, &tail_len) != 0) {
+        printf("  GCM tag verify FAILED\n");
         return -1;
     }
-    printf("  validate OK seq=%llu components=%zu\n",
-           (unsigned long long)sumo_manifest_sequence_number(m),
-           sumo_manifest_component_count(m));
+    if (tail_len > 0 && pump_decompressed(tail, tail_len) != 0)
+        return -1;
 
-    /* 2. Pull encryption_info out of the validated manifest. */
-    const uint8_t *enc_info; size_t enc_info_len;
-    rc = sumo_manifest_encryption_info(m, 0, &enc_info, &enc_info_len);
-    if (rc != 0) {
-        printf("  no encryption_info on component 0\n");
-        sumo_manifest_free(m);
+    /* Drain decompressor (verifies frame end). */
+    if (sumo_decompressor_finalize(s_zd) != 0) {
+        printf("  decompressor_finalize FAILED\n");
         return -1;
     }
 
-    /* 3. Streaming decrypt → decompress. Read ciphertext directly
-     *    from XIP-mapped inactive slot. */
-    psa_decryptor_t *d = psa_decryptor_create(enc_info, enc_info_len,
-                                               kKek, sizeof(kKek));
-    if (!d) {
-        printf("  psa_decryptor_create FAILED\n");
-        sumo_manifest_free(m);
-        return -1;
-    }
+    /* Final partial page → flash. */
+    if (flush_page_to_flash() != 0) return -1;
 
-    sumo_decompressor_t *zd = sumo_decompressor_create();
-    if (!zd) {
-        printf("  decompressor_create FAILED\n");
-        psa_decryptor_free(d); sumo_manifest_free(m);
-        return -1;
-    }
-
-    /* The inactive slot is XIP-mapped at XIP_BASE + offset. */
-    uint8_t s = (uint8_t)sumo_rp2350_active_slot(s_platform);
-    uint32_t slot_offset = (s == 0) ? kFlashCfg.slot_b_offset
-                                    : kFlashCfg.slot_a_offset;
-    const uint8_t *ct = (const uint8_t *)(XIP_BASE + slot_offset);
-
-    static uint8_t pt_buf[PT_BUF_CAP];
-    s_pt_total = 0;
-
-    /* Walk the ciphertext in 64 B chunks; pipe each decrypted batch
-     * through the decompressor. */
-    uint8_t  decrypted[128];
-    const uint32_t CHUNK = 64;
-    int err = 0;
-    for (uint32_t off = 0; off < s_payload_len && !err; off += CHUNK) {
-        uint32_t take = s_payload_len - off;
-        if (take > CHUNK) take = CHUNK;
-
-        size_t got = sizeof(decrypted);
-        if (psa_decryptor_update(d, ct + off, take, decrypted, &got) != 0) {
-            err = 1; break;
-        }
-        if (got == 0) continue;
-
-        const uint8_t *dp = decrypted;
-        size_t in_len = got;
-        while (in_len > 0) {
-            size_t out_cap = PT_BUF_CAP - s_pt_total;
-            if (out_cap == 0) { err = 1; break; }
-            size_t in_step = in_len;
-            int drc = sumo_decompressor_update(zd, dp, &in_step,
-                                                pt_buf + s_pt_total,
-                                                &out_cap);
-            if (drc != 0) { err = 1; break; }
-            dp     += in_step;
-            in_len -= in_step;
-            s_pt_total += out_cap;
-            if (in_step == 0 && out_cap == 0) break;
-        }
-    }
-
-    if (!err) {
-        size_t got = sizeof(decrypted);
-        if (psa_decryptor_finalize(d, decrypted, &got) != 0) {
-            err = 1;
-        } else if (got > 0 && s_pt_total + got <= PT_BUF_CAP) {
-            size_t in = got, out = PT_BUF_CAP - s_pt_total;
-            if (sumo_decompressor_update(zd, decrypted, &in,
-                                          pt_buf + s_pt_total, &out) != 0)
-                err = 1;
-            else
-                s_pt_total += out;
-        }
-        if (!err && sumo_decompressor_finalize(zd) != 0) err = 1;
-    }
-
-    psa_decryptor_free(d);
-    sumo_decompressor_free(zd);
-    sumo_manifest_free(m);
-
-    if (err) { printf("  decrypt/decompress FAILED\n"); return -1; }
-    printf("  recovered %u plaintext bytes\n", (unsigned)s_pt_total);
-
-    /* 4. SHA-256 of plaintext for host-side verification. */
+    /* Finish hash. */
     size_t hash_len = 0;
-    psa_status_t ps = psa_hash_compute(PSA_ALG_SHA_256,
-                                       pt_buf, s_pt_total,
-                                       s_pt_sha256, sizeof(s_pt_sha256),
-                                       &hash_len);
-    if (ps != PSA_SUCCESS || hash_len != 32) {
-        printf("  psa_hash_compute FAILED ps=%d\n", (int)ps);
+    if (psa_hash_finish(&s_hash_op, s_pt_sha256,
+                         sizeof(s_pt_sha256), &hash_len) != PSA_SUCCESS
+        || hash_len != 32) {
+        printf("  psa_hash_finish FAILED\n");
         return -1;
     }
-    printf("  sha256: ");
+    printf("  recovered %u plaintext bytes  sha256: ",
+           (unsigned)s_pt_written);
     for (int i = 0; i < 32; i++) printf("%02x", s_pt_sha256[i]);
     printf("\n");
     fflush(stdout);
@@ -461,45 +522,73 @@ static int run_pipeline(void) {
 static bool ota_exit_cb(const uds_request_t *req, uds_response_t *resp) {
     (void)req;
 
-    if (s_ota_state != OTA_NEED_PAYLOAD) {
-        resp->len = 2;
-        resp->data[0] = 0x7F;
-        resp->data[1] = 0x24;       /* requestSequenceError */
-        return false;
-    }
-    /* Last partial page → flash. */
-    if (flush_page() != 0) {
+    if (s_ota_state != OTA_NEED_PAYLOAD ||
+        s_payload_consumed != s_payload_len ||
+        s_ota_consumed     != s_ota_total) {
         s_ota_state = OTA_FAILED;
-        resp->len = 2;
-        resp->data[0] = 0x7F;
-        resp->data[1] = 0x72;
-        return false;
-    }
-    if (s_payload_offset != s_payload_len) {
-        s_ota_state = OTA_FAILED;
-        resp->len = 2;
-        resp->data[0] = 0x7F;
-        resp->data[1] = 0x24;
-        return false;
-    }
-    if (s_ota_consumed != s_ota_total) {
-        s_ota_state = OTA_FAILED;
-        resp->len = 2;
-        resp->data[0] = 0x7F;
-        resp->data[1] = 0x24;
+        ota_pipeline_free();
+        resp->len = 2; resp->data[0] = 0x7F; resp->data[1] = 0x24;
         return false;
     }
 
     s_ota_state = OTA_VALIDATING;
-    /* Run the SUIT pipeline synchronously. The host's request_timeout
-     * is configured generously (>2 s) so signature verify, decrypt,
-     * decompress, and SHA-256 all finish well within the window. */
-    int rc = run_pipeline();
+    int rc = finalize_pipeline();
+    ota_pipeline_free();
     s_ota_state = (rc == 0) ? OTA_OK : OTA_FAILED;
 
     resp->len = 1;
-    resp->data[0] = 0x77;            /* TransferExit positive response */
+    resp->data[0] = 0x77;
     return true;
+}
+
+/* ── 0x31 RoutineControl handler (start eraseMemory + results) ──── */
+
+#define ROUTINE_ERASE_MEMORY 0xFF00
+
+static void app_routine_control(const uds_request_t *req,
+                                uds_response_t *resp) {
+    if (req->data_len < 3) {
+        resp->len = 3; resp->data[0] = 0x7F;
+        resp->data[1] = req->sid; resp->data[2] = 0x13;
+        return;
+    }
+    uint8_t  sub        = req->data[0];
+    uint16_t routine_id = ((uint16_t)req->data[1] << 8) | req->data[2];
+
+    if (routine_id != ROUTINE_ERASE_MEMORY) {
+        resp->len = 3; resp->data[0] = 0x7F;
+        resp->data[1] = req->sid; resp->data[2] = 0x31; /* OOR */
+        return;
+    }
+
+    switch (sub) {
+    case 0x01:  /* startRoutine — kick off erase, return immediately. */
+        ota_reset();
+        s_ota_state      = OTA_PREPARING;
+        s_prepare_offset = 0;
+        printf("OTA prepare: erasing %u-byte inactive slot\n",
+               (unsigned)sumo_rp2350_inactive_size(s_platform));
+        fflush(stdout);
+        resp->len = 4;
+        resp->data[0] = 0x71;        /* RoutineControl positive resp */
+        resp->data[1] = 0x01;
+        resp->data[2] = (uint8_t)(routine_id >> 8);
+        resp->data[3] = (uint8_t)(routine_id & 0xFF);
+        return;
+    case 0x03: { /* requestRoutineResults — return current state. */
+        resp->len = 5;
+        resp->data[0] = 0x71;
+        resp->data[1] = 0x03;
+        resp->data[2] = (uint8_t)(routine_id >> 8);
+        resp->data[3] = (uint8_t)(routine_id & 0xFF);
+        resp->data[4] = (uint8_t)s_state_chars[s_ota_state];
+        return;
+    }
+    default:
+        resp->len = 3; resp->data[0] = 0x7F;
+        resp->data[1] = req->sid; resp->data[2] = 0x12; /* sub-fn NS */
+        return;
+    }
 }
 
 /* ── DID handlers ────────────────────────────────────────────────── */
@@ -508,17 +597,17 @@ static bool ota_did_read(uint16_t did,
                          uint8_t *out, uint8_t *out_len,
                          uint8_t max_len, uint8_t *out_nrc) {
     switch (did) {
-    case 0xF200:  /* OTA state */
-        if (max_len < 1) { *out_nrc = 0x14; return false; /* responseTooLong */ }
-        out[0] = (uint8_t)s_ota_state_chars[s_ota_state];
+    case 0xF200:
+        if (max_len < 1) { *out_nrc = 0x14; return false; }
+        out[0] = (uint8_t)s_state_chars[s_ota_state];
         *out_len = 1;
         return true;
-    case 0xF201:  /* SHA-256 of plaintext */
+    case 0xF201:
         if (max_len < 32) { *out_nrc = 0x14; return false; }
         memcpy(out, s_pt_sha256, 32);
         *out_len = 32;
         return true;
-    case 0xF202:  /* bytes consumed (uint32 LE) */
+    case 0xF202:
         if (max_len < 4) { *out_nrc = 0x14; return false; }
         out[0] = (uint8_t)(s_ota_consumed >>  0);
         out[1] = (uint8_t)(s_ota_consumed >>  8);
@@ -527,7 +616,7 @@ static bool ota_did_read(uint16_t did,
         *out_len = 4;
         return true;
     default:
-        return false;   /* lib/uds will then return a NRC */
+        return false;
     }
 }
 
@@ -550,25 +639,43 @@ static const uds_app_config_t s_app_cfg = {
     .transfer_exit    = ota_exit_cb,
 };
 
-/* ── Static DID seeding ──────────────────────────────────────────── */
-
 static void seed_did_store(void) {
     did_store_init();
-
     static const char *spare_part = "sumo-rp2350-checkpoint-4b";
     did_store_add(0xF187, (const uint8_t *)spare_part,
                   (uint8_t)strlen(spare_part), false, DID_ACCESS_PUBLIC);
-
     static const char *sw_version = "0.1.0-suit-over-uds";
     did_store_add(0xF195, (const uint8_t *)sw_version,
                   (uint8_t)strlen(sw_version), false, DID_ACCESS_PUBLIC);
-
     static const char *vendor = "tr-sdv-sandbox";
     did_store_add(0xF18C, (const uint8_t *)vendor,
                   (uint8_t)strlen(vendor), false, DID_ACCESS_PUBLIC);
 }
 
-/* ── Main ────────────────────────────────────────────────────────── */
+/* ── Erase tick — called once per main-loop iteration ──────────── */
+
+static void ota_prepare_tick(void) {
+    if (s_ota_state != OTA_PREPARING) return;
+
+    uint32_t base = sumo_rp2350_inactive_offset(s_platform);
+    uint32_t cap  = sumo_rp2350_inactive_size  (s_platform);
+    if (s_prepare_offset >= cap) {
+        s_ota_state = OTA_READY;
+        printf("OTA prepare: ready\n");
+        fflush(stdout);
+        return;
+    }
+    /* One sector per loop iteration: ~25 ms with interrupts disabled.
+     * The MCP2515 hardware buffers 2 frames during this window; the
+     * main loop drains them before the next erase, so well-paced host
+     * polling never overflows. */
+    uint32_t saved = save_and_disable_interrupts();
+    flash_range_erase(base + s_prepare_offset, FLASH_SECTOR_SIZE);
+    restore_interrupts(saved);
+    s_prepare_offset += FLASH_SECTOR_SIZE;
+}
+
+/* ── Main loop ───────────────────────────────────────────────────── */
 
 int main(void) {
     led_init();
@@ -578,39 +685,32 @@ int main(void) {
     sleep_ms(2000);
 
     printf("\n--- sumo-rp2350 uds-server "
-           "(checkpoint 4b: SUIT-over-UDS) ---\n");
+           "(checkpoint 4b: streaming SUIT-over-UDS) ---\n");
     fflush(stdout);
 
     STAGE(1, "stdio + led ok");
 
-    psa_status_t ps = psa_crypto_init();
-    if (ps != PSA_SUCCESS) {
-        printf("psa_crypto_init FAILED status=%d\n", (int)ps);
-        fflush(stdout);
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        printf("psa_crypto_init FAILED\n"); fflush(stdout);
         while (1) blink_n(1, 30, 970);
     }
     STAGE(2, "psa_crypto_init ok");
 
     if (!can_hw_init()) {
-        printf("can_hw_init FAILED — check XL2515 wiring + pin map\n");
-        fflush(stdout);
+        printf("can_hw_init FAILED\n"); fflush(stdout);
         while (1) blink_n(2, 30, 970);
     }
     STAGE(3, "XL2515 init ok @ 500 kbps, 8 MHz xtal");
 
     s_platform = sumo_rp2350_create(&kFlashCfg);
     if (!s_platform) {
-        printf("sumo_rp2350_create FAILED\n");
-        fflush(stdout);
+        printf("sumo_rp2350_create FAILED\n"); fflush(stdout);
         while (1) blink_n(3, 30, 970);
     }
-    s_pops = sumo_rp2350_platform_ops(s_platform);
-
     s_validator = sumo_validator_create(kTrustAnchor, sizeof(kTrustAnchor),
                                          NULL);
     if (!s_validator) {
-        printf("validator_create FAILED\n");
-        fflush(stdout);
+        printf("validator_create FAILED\n"); fflush(stdout);
         while (1) blink_n(4, 30, 970);
     }
     STAGE(4, "platform + validator ready");
@@ -619,30 +719,18 @@ int main(void) {
     seed_did_store();
     uds_server_init(&s_app_cfg);
 
-    /* Re-register 0x34/0x36/0x37 with requires_security=false. The lib
-     * defaults gate them on SecurityAccess unlock — production-correct,
-     * but 4b is testing the OTA pipeline shape, not access control.
-     * Adding security back is a 4c (or production hardening) pass.
-     *
-     * find_service in uds_server.c walks newest-first, so a re-register
-     * of an existing SID transparently overrides. We're using the lib's
-     * own service handlers (forward-declared below) so the only thing
-     * changing is the gate bit. */
-    extern void svc_request_download(const uds_request_t *req,
-                                      uds_response_t *resp);
-    extern void svc_transfer_data   (const uds_request_t *req,
-                                      uds_response_t *resp);
-    extern void svc_transfer_exit   (const uds_request_t *req,
-                                      uds_response_t *resp);
+    /* Re-register 0x34/0x36/0x37/0x31 with requires_security=false.
+     * 4b focuses on the OTA pipeline; 4c adds SecurityAccess back. */
+    extern void svc_request_download(const uds_request_t *, uds_response_t *);
+    extern void svc_transfer_data   (const uds_request_t *, uds_response_t *);
+    extern void svc_transfer_exit   (const uds_request_t *, uds_response_t *);
     uds_service_entry_t e;
-    e.sid = 0x34; e.handler = svc_request_download;
     e.session_mask = SESSION_MASK_PROGRAMMING; e.requires_security = false;
-    uds_server_register(&e);
-    e.sid = 0x36; e.handler = svc_transfer_data;
+    e.sid = 0x34; e.handler = svc_request_download; uds_server_register(&e);
     e.session_mask = SESSION_MASK_PROGRAMMING | SESSION_MASK_EXTENDED;
-    uds_server_register(&e);
-    e.sid = 0x37; e.handler = svc_transfer_exit;
-    uds_server_register(&e);
+    e.sid = 0x36; e.handler = svc_transfer_data;    uds_server_register(&e);
+    e.sid = 0x37; e.handler = svc_transfer_exit;    uds_server_register(&e);
+    e.sid = 0x31; e.handler = app_routine_control;  uds_server_register(&e);
 
     STAGE(5, "ISO-TP + DIDs + UDS server initialised");
 
@@ -673,8 +761,7 @@ int main(void) {
             fflush(stdout);
 
             uds_response_t resp;
-            bool send = uds_server_process(req, req_len,
-                                           /*functional=*/false, &resp);
+            bool send = uds_server_process(req, req_len, false, &resp);
             isotp_rx_done(&s_phys);
 
             if (send) {
@@ -685,6 +772,11 @@ int main(void) {
         }
 
         uds_server_poll();
+
+        /* Drive the slot erase one sector per iteration. Sits AFTER
+         * the CAN/UDS dispatch so any pending UDS request gets handled
+         * before we burn 25 ms in a flash erase. */
+        ota_prepare_tick();
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
         if ((now - last_blink_ms) >= 500) {
