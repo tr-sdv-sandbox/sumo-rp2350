@@ -7,26 +7,32 @@ top-level pico-sdk integration here.
 
 ## What it provides
 
-Two factory functions, both implementing the libsumo onboard
-callback contracts:
+A single shared handle that vends both libsumo onboard callback
+bundles:
 
 ```c
 #include <sumo/platform_rp2350.h>
 
-sumo_storage_ops_t *sumo_rp2350_storage_ops (const sumo_rp2350_config_t *cfg);
-sumo_platform_ops_t *sumo_rp2350_platform_ops(const sumo_rp2350_config_t *cfg);
+sumo_rp2350_t       *sumo_rp2350_create      (const sumo_rp2350_config_t *cfg);
+sumo_storage_ops_t  *sumo_rp2350_storage_ops (sumo_rp2350_t *r);
+sumo_platform_ops_t *sumo_rp2350_platform_ops(sumo_rp2350_t *r);
+int                  sumo_rp2350_active_slot (sumo_rp2350_t *r);
+void                 sumo_rp2350_free        (sumo_rp2350_t *r);
 ```
 
-- `storage_ops` keeps the libsumo policy (`sumo_seq`, `sumo_sec_ver`,
-  `sumo_reject_before`) in a single dedicated 4 KB flash sector,
-  written atomically with a CRC32 + magic guard. Strict-greater
-  rollback semantics from libsumo handle bad/incomplete writes safely.
-- `platform_ops` writes decrypted firmware into one of two staging
-  slots (A/B). `swap()` flips an active-slot byte stored in the kv
-  sector; `invoke()` is a default no-op the integrator can override.
-  `fetch()` is **not** implemented here — the integrator supplies a
-  function pointer that pulls payloads from whatever transport the
-  app uses (UDS-over-CAN-ISO-TP, raw CAN, USB-CDC, …).
+- `storage_ops` keeps libsumo policy values (`sumo_seq`, `sumo_sec_ver`,
+  `sumo_reject_before`) plus the active-slot byte in a **littlefs**
+  filesystem mounted on a configurable flash region. Each key is a
+  small file; littlefs handles wear leveling, power-fail recovery,
+  and arbitrary key sets.
+- `platform_ops` writes decrypted firmware into one of two raw-flash
+  staging slots (A/B), bypassing littlefs since firmware images are
+  large and want page-direct writes. `swap()` flips
+  `/active_slot` in the fs; `invoke()` is a default no-op the
+  integrator can override. `fetch()` is **not** implemented here —
+  the integrator supplies a function pointer that pulls payloads
+  from whatever transport the app uses (UDS-over-CAN-ISO-TP, raw
+  CAN, USB-CDC, …).
 
 ## What it does *not* do
 
@@ -36,9 +42,6 @@ sumo_platform_ops_t *sumo_rp2350_platform_ops(const sumo_rp2350_config_t *cfg);
 - **No bootloader.** RP2350 doesn't need a custom one for OTA — the
   integrator's app does the validation and re-flashing in user space
   before letting the device reset.
-- **No filesystem.** v1 uses raw flash with a fixed-layout kv blob.
-  pico-littlefs is a clean future swap (the
-  `sumo_storage_ops_t` abstraction was designed for it).
 
 ## Building
 
@@ -68,19 +71,49 @@ pico_add_extra_outputs(my_ecu)
 
 Configurable via `sumo_rp2350_config_t`. Defaults assume 4 MB flash:
 
-| Region       | Default offset (XIP-relative) | Size  | Used for                              |
-|--------------|-------------------------------|-------|---------------------------------------|
-| App image    | `0x0000_0000`                 | 1 MB  | Bootloader-loaded firmware            |
-| Slot A       | `0x0010_0000`                 | 1 MB  | OTA staging A                         |
-| Slot B       | `0x0020_0000`                 | 1 MB  | OTA staging B                         |
-| sumo kv      | `0x003F_F000`                 | 4 KB  | sumo_seq / sumo_sec_ver / active slot |
+| Region    | Default offset (XIP-relative) | Size   | Used for                       |
+|-----------|-------------------------------|--------|--------------------------------|
+| App image | `0x0000_0000`                 | 1 MB   | Bootloader-loaded firmware     |
+| Slot A    | `0x0010_0000`                 | 1 MB   | OTA staging A                  |
+| Slot B    | `0x0020_0000`                 | 1 MB   | OTA staging B                  |
+| sumo fs   | `0x003F_0000`                 | 16 KB  | littlefs (sumo_seq, sec_ver, …)|
 
 The integrator can override any of these; the only invariants are
-sector-alignment (4 KB) and non-overlap.
+4 KB sector alignment, non-overlap, and `fs_size >= 8 KB` (littlefs
+needs two blocks for its metadata pair).
+
+## Storage backend — littlefs
+
+`storage_ops` is backed by [littlefs](https://github.com/littlefs-project/littlefs)
+(vendored at `3rdparty/littlefs`, currently v2.11.3). On first boot
+the configured region is auto-formatted; subsequent boots just
+mount. Each policy key (`/sumo_seq`, `/sumo_sec_ver`,
+`/sumo_reject_before`, `/active_slot`) is a small file. The block
+device callbacks bridge littlefs to `flash_range_program` /
+`flash_range_erase` under a `save_and_disable_interrupts()` critical
+section so the XIP instruction fetch can't fault while a sector is
+being programmed.
+
+Why a real fs over a raw struct: arbitrary keys without redesigning
+the layout, real wear leveling for environments where the device
+sees frequent re-validation, and standard power-fail recovery
+behaviour — all for ~10 KB of code.
+
+## Example app
+
+`examples/minimal/` is a tiny smoke-test that mounts the kv,
+increments a `boot_count` field, prints state, and parks. Use it as
+the first thing you flash on a fresh board to confirm the binding
+runs end-to-end. Build instructions live in that directory's README.
 
 ## Status
 
-v1 — minimum viable. Storage works for known libsumo keys
-(`sumo_seq`, `sumo_sec_ver`, `sumo_reject_before`) and the active-slot
-flag. Arbitrary-key support, wear leveling, and pico-littlefs are
-deferred until a real device run flags them as needed.
+v1 — minimum viable. Storage works for any string key (libsumo's
+known three plus anything else the integrator wants). The pieces
+that still need attention:
+
+- Cross-built crypto deps (libcsuit / t_cose / qcbor / libzstd /
+  OpenSSL or mbedTLS) for Cortex-M33 — the example links but
+  validation needs these on-device.
+- Multi-component A/B slots (today swap() tracks one global active
+  byte; multi-image firmware needs per-component slots).
