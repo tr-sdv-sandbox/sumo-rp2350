@@ -30,9 +30,9 @@ if ! command -v apt-get >/dev/null 2>&1; then
     cat >&2 <<EOF
 error: setup-deps.sh targets Debian/Ubuntu. Install equivalents manually:
        cmake build-essential git python3 libusb-1.0-0-dev
-       gcc-arm-none-eabi g++-arm-none-eabi
+       gcc-arm-none-eabi (includes arm-none-eabi-g++)
        libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
-       arm-none-eabi-gdb
+       gdb-multiarch
        picotool (build from source against the Pico SDK)
 EOF
     exit 1
@@ -48,10 +48,9 @@ sudo apt-get install -y --no-install-recommends \
     python3 \
     libusb-1.0-0-dev \
     gcc-arm-none-eabi \
-    g++-arm-none-eabi \
     libnewlib-arm-none-eabi \
     libstdc++-arm-none-eabi-newlib \
-    arm-none-eabi-gdb
+    gdb-multiarch
 
 # ── Pico SDK ───────────────────────────────────────────────────────
 echo "==> Pico SDK $PICO_SDK_VERSION → $SDK_DIR"

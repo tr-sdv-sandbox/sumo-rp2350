@@ -23,26 +23,19 @@ set(SUMO_RP2350_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..
 set(LIBSUMO_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/../../../libsumo
     CACHE PATH "Path to libsumo's onboard tree")
 
-# libsumo's onboard library has a Linux-only fall-through that pulls
-# in libcurl. The Pico build doesn't have/need it, so wire just the
-# onboard sources directly here. We intentionally side-step
-# libsumo/onboard/CMakeLists.txt — that file is host-targeted.
-add_library(sumo_onboard_pico STATIC
-    ${LIBSUMO_DIR}/onboard/src/validator.c
-    ${LIBSUMO_DIR}/onboard/src/decryptor.c
-    ${LIBSUMO_DIR}/onboard/src/decompressor.c
-    ${LIBSUMO_DIR}/onboard/src/policy.c
-    ${LIBSUMO_DIR}/onboard/src/orchestrator.c)
-
-target_include_directories(sumo_onboard_pico PUBLIC
+# This example only touches sumo-rp2350's storage_ops + active-slot
+# accessor. It uses libsumo's public struct typedefs (sumo_storage_ops_t
+# / sumo_platform_ops_t) but not any of libsumo's compiled code, so
+# pull in just the headers — no cross-build of libcsuit / libzstd /
+# t_cose / qcbor / mbedtls needed to flash this example.
+#
+# A "full" example that exercises sumo_validate_envelope +
+# sumo_process_image will need those deps cross-built against
+# Cortex-M33; that's the next bring-up step.
+add_library(sumo_onboard_headers INTERFACE)
+target_include_directories(sumo_onboard_headers INTERFACE
     ${LIBSUMO_DIR}/onboard/include)
 
-# libsumo's onboard depends on libcsuit, t_cose, qcbor, libzstd, and a
-# crypto backend (OpenSSL or mbedTLS). Those need to be cross-built
-# for the Cortex-M33; that's still outstanding. For now this CMake
-# file establishes the example's structure — actual flashable
-# firmware needs the embedded crypto/zstd toolchain wired up. See
-# README for the bring-up checklist.
 add_subdirectory(${SUMO_RP2350_DIR} sumo-rp2350 EXCLUDE_FROM_ALL)
 
 add_executable(sumo_rp2350_minimal main.c)
@@ -51,7 +44,7 @@ target_link_libraries(sumo_rp2350_minimal
     pico_stdlib
     hardware_flash
     hardware_sync
-    sumo_onboard_pico
+    sumo_onboard_headers
     sumo-rp2350)
 
 pico_enable_stdio_usb (sumo_rp2350_minimal 1)

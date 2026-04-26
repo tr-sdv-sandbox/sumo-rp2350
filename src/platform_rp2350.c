@@ -18,6 +18,7 @@
  */
 #include "sumo/platform_rp2350.h"
 
+#include <stdio.h>   /* snprintf */
 #include <stdlib.h>
 #include <string.h>
 

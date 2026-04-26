@@ -37,12 +37,12 @@ static int fetch_unimplemented(const char *uri, size_t uri_len,
 /* Default flash layout for a 4 MB device. Matches the table in the
  * top-level README — adjust to your board's free regions. */
 static const sumo_rp2350_config_t kDefaultCfg = {
-    .fs_offset     = 0x003F'0000,  /* 16 KB filesystem region */
-    .fs_size       = 0x0000'4000,
-    .slot_a_offset = 0x0010'0000,
-    .slot_a_size   = 0x0010'0000,
-    .slot_b_offset = 0x0020'0000,
-    .slot_b_size   = 0x0010'0000,
+    .fs_offset     = 0x003F0000,  /* 16 KB filesystem region */
+    .fs_size       = 0x00004000,
+    .slot_a_offset = 0x00100000,
+    .slot_a_size   = 0x00100000,
+    .slot_b_offset = 0x00200000,
+    .slot_b_size   = 0x00100000,
     .fetch_fn      = fetch_unimplemented,
     .fetch_ctx     = NULL,
 };
