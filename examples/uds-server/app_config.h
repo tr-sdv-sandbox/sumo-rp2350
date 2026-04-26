@@ -2,14 +2,15 @@
 #define APP_CONFIG_H
 
 /*
- * Application-level overrides for uds-tiny's library defaults.
+ * Per-application defines for the MCP2515 driver and CAN-ID layout.
  *
- * Compile this header in via -DUDS_APP_CONFIG="\"app_config.h\"",
- * -DSTORE_APP_CONFIG=..., -DISOTP_APP_CONFIG=...   (see CMakeLists.txt).
- *
- * Every #define here either overrides a library default or supplies a
- * value the MCP2515 driver references directly (CAN addressing,
- * extended-ID flag, etc — those are NOT library knobs).
+ * NOTE: this header deliberately does NOT override uds-tiny's library
+ * sizing knobs (ISOTP_RX_BUF_SIZE, DID_MAX_ENTRIES, ...). The lib
+ * compiles into separate static libraries with their own sizes baked
+ * into struct layouts; if the app overrides those, the lib and app
+ * disagree on sizeof(isotp_channel_t) etc. and the app's static
+ * allocations get smashed by lib-side memset()s. Stick to lib defaults
+ * here; bump them at the lib level (in uds-tiny) when needed.
  */
 
 #include <stdint.h>
@@ -19,17 +20,5 @@
 #define CAN_TESTER_ADDR      0xF1
 #define CAN_USE_EXT_ID       1
 #define CAN_BAUDRATE_KBPS    500
-
-/* ── ISO-TP buffers — small for MVP, no SUIT envelopes yet ──────── */
-#define ISOTP_RX_BUF_SIZE    256
-#define ISOTP_TX_BUF_SIZE    256
-#define ISOTP_MAX_PAYLOAD    255
-
-/* ── UDS — keep tables small; only 4 services exercised in MVP ──── */
-#define UDS_MAX_SERVICES     16
-#define DID_MAX_ENTRIES      16
-#define DID_MAX_DATA_LEN     32
-#define DTC_MAX_ENTRIES      4
-#define IO_OUTPUT_MAX        2
 
 #endif /* APP_CONFIG_H */

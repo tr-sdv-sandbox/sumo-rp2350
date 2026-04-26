@@ -35,13 +35,7 @@ target_include_directories(sumo_rp2350_uds-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/hal)
 
-# Tell the uds-tiny libs to pull in our app_config.h overrides.
-# Wrapped in escaped quotes because the lib does
-# `#include UDS_APP_CONFIG` (not a string-literal in code).
 target_compile_definitions(sumo_rp2350_uds-server PRIVATE
-    UDS_APP_CONFIG="app_config.h"
-    STORE_APP_CONFIG="app_config.h"
-    ISOTP_APP_CONFIG="app_config.h"
     PICO_STACK_SIZE=0x1000)
 
 target_link_libraries(sumo_rp2350_uds-server

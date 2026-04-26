@@ -108,7 +108,7 @@ OK — full UDS round-trip succeeded.
 | Section | Bytes |
 |---|---|
 | `.text` | 59,632 |
-| `.bss`  | 7,548  |
+| `.bss`  | 11,900 |
 | `.bin`  | 53 KB  |
 | `.uf2`  | 105 KB |
 
