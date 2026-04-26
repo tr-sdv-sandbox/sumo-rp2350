@@ -57,31 +57,48 @@ cmake --build "$BUILD_DIR" -j --target "$TARGET" 2>&1 | tail -3
 # block is written to the start of flash but `picotool partition
 # info` (and presumably the bootrom A/B picker) won't find it.
 echo "==> picotool partition create $(basename "$PT_JSON")"
-picotool partition create "$PT_JSON" "$PT_BIN" --abs-block --quiet
+# --abs-block takes an optional <abs_block_loc> hex positional, so any
+# flag placed after it gets parsed as that hex value (we hit "--quiet
+# is not a valid hex value"). Put --quiet up front and keep
+# --abs-block last on this line.
+picotool partition create --quiet "$PT_JSON" "$PT_BIN" --abs-block
 
-# 3. Reboot to BOOTSEL + full flash erase
+# 3. Reboot to BOOTSEL + full flash erase. Run reboot loudly so we see
+# whether the device was reachable at all — silent failure here is
+# what makes the rest of the script appear to "do nothing".
 echo "==> picotool reboot -uf  (force into BOOTSEL)"
-picotool reboot -uf 2>/dev/null || true
+picotool reboot -uf || {
+    echo "warn: reboot -uf failed; if the device is already in BOOTSEL"
+    echo "      this is fine — continuing."
+}
 sleep 3
 
 echo "==> picotool erase  (wipe all 4 MB)"
-picotool erase --quiet 2>&1 | tail -1
+picotool erase
 
-# 4. Flash partition table.
-# --ignore-partitions overwrites any prior PT (otherwise the device's
-# old PT can refuse the write if its bootloader perms were 'r'). Erase
-# above already wiped flash, but keep --ignore-partitions defensive.
+# 4. Flash partition table. --ignore-partitions overwrites any prior
+# PT (otherwise the device's old PT can refuse the write if its
+# bootloader perms were 'r'). Erase above already wiped flash, but
+# --ignore-partitions stays defensive.
 echo "==> picotool load partition_table.uf2"
-picotool load -v --ignore-partitions "$PT_BIN" > /dev/null
+picotool load -v --ignore-partitions "$PT_BIN"
+
+# Reboot back to BOOTSEL so picotool re-reads the freshly-written
+# partition table on its next connect. Without this, picotool's
+# cached partition state from before the PT load is stale and the
+# next load step errors with "modified data (pt modified since load)".
+echo "==> picotool reboot -u  (re-enter BOOTSEL with new PT)"
+picotool reboot -u || true
+sleep 3
 
 # 5. Flash factory image into App-A. Partition index 0 in our table
-# is App-A (id=1). picotool's -p takes the *index*, not the id/name.
+# is App-A. picotool's -p takes the *index*, not the id/name.
 echo "==> picotool load -p 0 $(basename "$UF2")  (= App-A)"
-picotool load -v -p 0 "$UF2" > /dev/null
+picotool load -v -p 0 "$UF2"
 
 # 6. Reboot to application
 echo "==> picotool reboot -a"
-picotool reboot -a 2>/dev/null || true
+picotool reboot -a || true
 sleep 3
 
 # 7. Attach console

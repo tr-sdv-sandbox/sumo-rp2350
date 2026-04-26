@@ -165,11 +165,21 @@ target_include_directories(sumo_rp2350_ota-flow PRIVATE
 target_compile_definitions(sumo_rp2350_ota-flow PRIVATE
     PICO_STACK_SIZE=0x1000
 
-    # 0xF195 software-version DID — only metadata baked at build
-    # time for now. PICO_CRT0_IMAGE_TYPE_TBYB and the bootrom-side
-    # version (PICO_CRT0_VERSION_MAJOR/MINOR) get layered in once
-    # we've confirmed the basic build still boots after the cmake
-    # rename.
+    # IMAGE_DEF: bake the major/minor into the bootrom-recognised
+    # version words so the A/B picker can rank slots by version when
+    # there's no FUB in play. PICO_CRT0_VERSION_* are the canonical
+    # SDK knobs for this; their values land in the IMAGE_DEF block.
+    PICO_CRT0_VERSION_MAJOR=${OTA_VERSION_MAJOR}
+    PICO_CRT0_VERSION_MINOR=${OTA_VERSION_MINOR}
+
+    # IMAGE_DEF: TBYB flag. ON for OTA images so the bootrom requires
+    # rom_explicit_buy() on the first flash-update boot. OFF for the
+    # factory install (which is loaded by picotool, not via FUB, and
+    # must boot first time without a buy ceremony).
+    PICO_CRT0_IMAGE_TYPE_TBYB=$<IF:$<BOOL:${OTA_TBYB}>,1,0>
+
+    # 0xF195 software-version DID — same string the picker sees in
+    # the IMAGE_DEF, exposed back over UDS for the orchestrator.
     OTA_FW_VERSION_STR="${OTA_VERSION_STR}")
 
 target_link_libraries(sumo_rp2350_ota-flow
@@ -198,5 +208,23 @@ target_link_options(sumo_rp2350_ota-flow PRIVATE
 
 pico_enable_stdio_usb (sumo_rp2350_ota-flow 1)
 pico_enable_stdio_uart(sumo_rp2350_ota-flow 0)
+
+# Add a SHA-256 HASH_DEF block to the IMAGE_DEF metadata. The RP2350
+# bootrom uses this to validate the image at boot. Without it, the
+# FUB-into-TBYB-image path silently falls back to the prior slot
+# (the bootrom can't verify the image). Must be called BEFORE
+# pico_add_extra_outputs.
+pico_hash_binary(sumo_rp2350_ota-flow)
+
+# Sign the IMAGE_DEF with secp256k1. Empirically (and matching the
+# pico-examples picow_ota_update reference), the bootrom's FUB+TBYB
+# validation requires a SIGNATURE block in addition to the HASH —
+# even on UNSECURED RP2350 with secure_boot=0. With hash-only the
+# bootrom records boot_type=F and reboot_p0 correctly but does not
+# enter TBYB mode (boot_diagnostic stays 0, partition stays at the
+# prior slot). With a secp256k1 signature in the IMAGE_DEF, the
+# validation path engages and FUB lands in the staged slot.
+pico_sign_binary(sumo_rp2350_ota-flow
+    ${CMAKE_CURRENT_SOURCE_DIR}/keys/bootkey.pem)
 
 pico_add_extra_outputs(sumo_rp2350_ota-flow)

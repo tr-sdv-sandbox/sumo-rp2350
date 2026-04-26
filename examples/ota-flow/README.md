@@ -1,246 +1,281 @@
-# examples/uds-server — checkpoints 4a + 4b
+# examples/ota-flow — checkpoint 4c
 
-UDS-on-CAN server running on a Waveshare RP2350-CAN. Two layered
-demos:
+A/B OTA on a Waveshare RP2350-CAN with the bootrom's
+flash-update-boot + try-before-you-buy mechanism doing the slot
+switch and rollback. Builds on 4b's SUIT-over-UDS download path,
+adds activate / commit / rollback as RoutineControl IDs, and an
+end-to-end orchestrator that runs the device through a chain of
+firmware versions.
 
-- **4a** — bare UDS bring-up (DiagSession + ECUReset + ReadDID +
-  TesterPresent), driven by `host/run-test.sh`.
-- **4b** — SUIT-over-UDS download: host pushes a SUIT envelope+payload
-  over UDS RequestDownload + TransferData + TransferExit, device
-  validates the envelope, decrypts and decompresses the payload, and
-  exposes the recovered plaintext's SHA-256 via DID `0xF201`. Driven
-  by `host/run-ota.sh`. A/B activate + reset is deferred to 4c.
-
-## What's running on the device
+## Demo
 
 ```
-   main.c
-     │
-     ▼
-   isotp_init(&ch, RX_ID, TX_ID, can_send_cb, NULL)
-     │  ─ register can_send_cb that forwards to mcp2515_send
-     │
-   uds_server_init(&app_cfg)
-     │  ─ register ECUReset hook → watchdog_reboot
-     │
-   seed_did_store()
-     │  ─ 0xF187 (spare part), 0xF195 (sw ver), 0xF18C (vendor)
-     │
-   for(;;):
-     can_hw_receive() ── frames ──▶ isotp_on_rx
-     isotp_poll                                         (CF/FC timing)
-     isotp_rx_ready ─▶ isotp_rx_data ─▶ uds_server_process
-                                                   │
-                                            isotp_send ─▶ can_hw_send
-     uds_server_poll                              (S3 timer / lockout)
+$ ./flash-factory.sh                     # one-shot factory install
+$ ./host/run-ota-cycle.sh 1.1.0 1.2.0 1.3.0
 ```
 
-CAN: 500 kbit/s, 29-bit extended addressing, 8 MHz crystal on the
-XL2515. Device IDs default to ECU=0x42, tester=0xF1, giving:
-- physical RX (host→device): `0x18DA42F1`
-- physical TX (device→host): `0x18DAF142`
-- functional RX:             `0x18DB33F1` (subscribed but not used yet)
+Each version: build → SUIT-package → push over UDS to the inactive
+slot → activate → ECUReset → bootrom does FUB+TBYB into the new
+slot → 10-second settle → commit → assert `ReadDID(0xF195)` returns
+the new version.
+
+## Flow at the wire
+
+```
+Tester                                                      Device
+──────                                                      ──────
+DiagnosticSessionControl(programming) ───────────────────▶  state I
+RoutineControl(0xFF00 eraseMemory) ──────────────────────▶  state P
+                                              ◀────────── erase tick (~6 s)
+ReadDID(0xF200)  ────────────────────────────────────────▶  state R
+RequestDownload(0, framed_size) ─────────────────────────▶  R → ready
+TransferData(seq=1..N, 256 B chunks) ────────────────────▶  D (writing)
+                                              ◀────────── decrypt + zstd
+                                                          + flash + sha256
+TransferExit ────────────────────────────────────────────▶  V → S
+ReadDID(0xF200) ─────────────────────────────────────────▶  S (staged)
+
+RoutineControl(0xF001 activate) ─────────────────────────▶  S (still),
+                                                          trial_state=PENDING
+                                                          in littlefs
+ECUReset(hardReset) ─────────────────────────────────────▶  ecu_reset_hook:
+                                                          rom_reboot(FUB,
+                                                            XIP+slot_b, …)
+                                                  ◀──── chip resets, FUB
+                                                  ◀──── bootrom validates
+                                                          App-B IMAGE_DEF
+                                                          (hash + signature)
+                                                  ◀──── App-B boots,
+                                                          state = T (trial),
+                                                          tbyb_info=0x01
+[reconnect ISO-TP] ─────────────────────────────────────▶  Listening …
+ReadDID(0xF195) ─────────────────────────────────────────▶  "1.1.0"
+ReadDID(0xF200) ─────────────────────────────────────────▶  T
+ReadDID(0xF203)  poll until 1 (settle elapsed) ──────────▶  0/1
+                                                          (10 s default)
+
+RoutineControl(0xF002 commit) ───────────────────────────▶  rom_explicit_buy
+                                                          → bootrom erases
+                                                            App-A IMAGE_DEF
+                                                          → state = K
+ReadDID(0xF200) ─────────────────────────────────────────▶  K (committed)
+```
+
+## Design choices and the bootrom side of things
+
+### A/B + TBYB requires a SIGNED IMAGE_DEF, not just hashed
+
+Even on an UNSECURED RP2350 (`secure_boot=0`), the bootrom's
+flash-update-boot validation will silently fall back to the prior
+slot if the FUB target only carries a HASH_DEF — `boot_type=F`
+surfaces but `tbyb_and_update_info` stays zero, `boot_diagnostic`
+stays zero, and `partition` is the previous slot. Adding a
+`SIGNATURE` block (any secp256k1 PEM key works since the public
+key's OTP fingerprint isn't checked when secure boot is off) makes
+TBYB actually engage. The pico-examples `picow_ota_update`
+reference does the same: `pico_hash_binary` + `pico_sign_binary`.
+
+### Activate is "arm only"; tester drives the reset
+
+In an automotive flow the tester decides when a reset is safe:
+the vehicle may be moving, or several ECUs may need to be staged
+before any of them resets. So our `RoutineControl(0xF001 activate)`:
+
+- Persists `trial_state = PENDING` and the staged slot's flash
+  offset to littlefs.
+- Returns the standard positive RoutineControl response.
+- **Does not reboot.**
+
+The tester then issues UDS `ECUReset(hardReset)` separately. The
+device's `ecu_reset_hook` reads the trial flag and chooses between
+a FLASH_UPDATE_BOOT (if armed) and a normal `watchdog_reboot`.
+
+### Commit is gated on a 10-second settle period
+
+The bootrom's TBYB watchdog gives us 16.7 seconds before it auto-
+rolls back to the prior slot. We don't want to consume that budget
+by committing the very first instant we boot the new image — the
+new firmware should at least make it through `main()` initialisation
+and run the dispatch loop for a while before we declare it good.
+
+The boot path enters trial without calling `rom_explicit_buy`,
+records `s_trial_boot_ms`, and pets the bootrom watchdog every
+main-loop iteration. After `TRIAL_SETTLE_MS` (10 s default) of
+healthy iteration the device sets `s_trial_settle_passed = true`
+and exposes `1` on `DID 0xF203`. Any commit request before then
+returns NRC `0x22`. The orchestrator polls `0xF203` so it can fire
+the commit immediately when the gate opens, rather than waiting a
+full P2 timeout.
+
+### Auto-rollback is in HW, not in our code
+
+Once the new image is in trial, three things can happen:
+
+1. **App keeps running, tester commits** → `rom_explicit_buy`
+   succeeds → bootrom erases the OTHER slot's IMAGE_DEF → state = K.
+   Subsequent normal boots stay in the new slot. **No app-level
+   rollback after this point** — the bootrom A/B picker can no
+   longer find the old image.
+2. **App hangs (hardfault, infinite loop, …)** → main loop stops
+   petting the bootrom watchdog → 16.7 s later watchdog fires →
+   chip resets → bootrom on next boot picks the surviving slot
+   (TBYB-flagged candidate is skipped on a non-FUB boot). Automatic
+   rollback in HW.
+3. **Power loss before commit** → bootrom's TBYB pending flag is
+   still set → next power-up: bootrom doesn't see FUB intent, picks
+   the un-TBYB'd slot (the prior one). Tester sees the device back
+   in the old version; can re-issue ECUReset to retry the trial.
+
+The previous design's "littlefs `trial_boots` counter +
+`MAX_TRIAL_BOOTS` self-rollback" is gone. It was incompatible with
+this flow: once `rom_explicit_buy` runs, the bootrom erases the
+other slot, so a later self-rollback by erasing our own IMAGE_DEF
+would brick the device. The bootrom's HW watchdog is both simpler
+and more reliable.
+
+### Flash layout
+
+```
+0x000000 .. 0x0FFFFF (1 MB)   unpartitioned
+0x100000 .. 0x1FFFFF (1 MB)   App-A (id 0)
+0x200000 .. 0x2FFFFF (1 MB)   App-B (id 0, linked A-pair of A)
+0x300000 .. 0x3EFFFF          unpartitioned
+0x3F0000 .. 0x3FFFFF (64 KB)  LittleFS-KV (id 1)
+```
+
+The two main-app partitions share `id = 0` and B carries
+`"link": ["a", 0]` — matching pico-examples' `picow_ota_update`.
+The bootrom uses the `link` to identify A/B siblings; the IDs don't
+need to be unique.
+
+`unpartitioned` accepts the `absolute` family for the RP2350-E10
+erratum fix.
+
+## DIDs
+
+| DID    | Type      | Description                                    |
+|--------|-----------|------------------------------------------------|
+| 0xF187 | string    | Spare-part identifier (`sumo-rp2350-ota-flow`) |
+| 0xF195 | string    | Software version (e.g. `"1.1.0"`)              |
+| 0xF200 | char      | OTA state (`I`/`P`/`R`/`H`/`E`/`D`/`V`/`S`/`T`/`K`/`X`) |
+| 0xF201 | sha256    | Recovered plaintext SHA-256 (after V state)    |
+| 0xF202 | uint32 LE | Bytes consumed in current download             |
+| 0xF203 | uint8     | Trial settle elapsed (`0` = no, `1` = yes)     |
+| 0xF204 | char      | Last boot type (`N`/`F`/`B`/`?`)               |
+
+## RoutineControl IDs
+
+| ID      | Function    | Effect                                                                      |
+|---------|-------------|-----------------------------------------------------------------------------|
+| 0xFF00  | eraseMemory | Erase the inactive slot, transitions to state R                             |
+| 0xF001  | activate    | Persist `trial_state=PENDING` + target slot offset in littlefs              |
+| 0xF002  | commit      | Gated on settle; calls `rom_explicit_buy`; state → K                        |
+| 0xF003  | rollback    | (Trial only) Erase OWN IMAGE_DEF + reboot — bootrom picks survivor         |
+
+## Files
+
+```
+ota-flow/
+├── CMakeLists.txt          # version-stamped build, hash + sign + TBYB
+├── README.md               # this file
+├── partition_table.json    # A/B + LittleFS layout
+├── flash-factory.sh        # one-shot factory install of v1.0.0 + PT
+├── test-picotool-fub.sh    # debugging helper for the FUB pipeline
+├── test-version-ranking.sh # debugging helper for bootrom A/B ranking
+├── pico_sdk_import.cmake
+├── pin_config.h            # XL2515 SPI pinout
+├── app_config.h            # uds-tiny + MCP2515 sizing knobs
+├── mbedtls_config.h        # PSA crypto configuration
+├── psa_crypto_config.h
+├── main.c                  # application
+├── uds_platform_time.c     # uds-tiny time hook
+├── hal/
+│   ├── can_hw.{c,h}        # uds-tiny CAN-HAL adapter
+│   ├── mcp2515.{c,h}       # IRQ-driven driver, 256-deep RX FIFO
+│   └── mcp2515_regs.h
+├── keys/
+│   ├── README.md
+│   ├── bootkey.pem         # secp256k1 — RP2350 IMAGE_DEF signing
+│   ├── sign.key            # COSE — sumo-tool envelope signing
+│   ├── sign.pub
+│   └── devkey.cose         # COSE — sumo-tool encryption KEK
+└── host/
+    ├── log-console.sh      # auto-reconnecting USB-CDC tail
+    ├── ota-cycle.py        # multi-version OTA chain orchestrator
+    ├── ota.py              # single-cycle helper (legacy)
+    ├── run-ota-cycle.sh    # venv launcher
+    ├── run-ota.sh
+    ├── run-test.sh
+    ├── setup-can.sh
+    ├── tester.py
+    └── requirements.txt
+```
 
 ## Hardware
 
-Waveshare RP2350-CAN (XL2515 + SIT65HVD230). Pin map in `pin_config.h`:
+Waveshare RP2350-CAN (XL2515 + SIT65HVD230). Pin map in
+`pin_config.h`. CAN at 500 kbit/s, 29-bit extended addressing,
+8 MHz crystal on the XL2515.
 
-| Function     | GPIO | Pico-SDK signal |
-|--------------|------|-----------------|
-| SPI1_SCK     | 10   | spi1            |
-| SPI1_MOSI    | 11   | spi1            |
-| SPI1_MISO    | 12   | spi1            |
-| MCP2515 /CS  | 9    |                 |
-| MCP2515 /INT | 8    |                 |
+ECU = `0x42`, tester = `0xF1`:
+- physical RX (host→device): `0x18DA42F1`
+- physical TX (device→host): `0x18DAF142`
+- functional RX:             `0x18DB33F1`
 
-If your board's silkscreen disagrees, edit `pin_config.h` accordingly.
+## Build + first flash
 
-## Build + flash
+```sh
+# one-shot: cmake builds v1.0.0, partition table is created and
+# loaded, factory image is written into App-A, device reboots into
+# the application:
+./flash-factory.sh
 
-```
-cd sumo-rp2350/examples/uds-server
-./flash.sh
-```
-
-(`flash.sh` builds, `picotool load -x`'s the UF2, then attaches a
-USB-CDC console at 115200 8N1.)
-
-Expected console output:
-
-```
---- sumo-rp2350 uds-server (checkpoint 4a: UDS bring-up) ---
-stage 1: stdio + led ok
-stage 2: XL2515 init ok @ 500 kbps, 8 MHz xtal
-stage 3: ISO-TP channel created
-stage 4: DID store seeded (F187 F195 F18C)
-stage 5: UDS server initialised
-Listening on RX=0x18da42f1  TX=0x18daf142  (29-bit)
+# verify:
+picotool info -a -f
+# Partition 0  version=1.0  hash: verified  signature: verified
+# Partition 1  version=…    (whatever's there from prior runs)
 ```
 
-LED on `PICO_DEFAULT_LED_PIN` then blinks at 1 Hz; each incoming UDS
-request prints a `UDS req: ...` / `UDS rsp: ...` line.
+## Run an OTA chain
 
-## Bench loop with a Linux host
+In one terminal:
 
-Needs a USB-CAN adapter (slcan-style — CANable v1, generic dongles,
-etc.). Wire H↔H, L↔L, plus one termination resistor at the far end
-(the Waveshare board has a selectable 120 Ω terminator).
-
-```
-cd host
-sudo ./setup-can.sh                # auto-picks the non-Pico ttyACM,
-                                   # bridges via slcand to can0 @ 500k
-./run-test.sh                      # creates host/.venv on first run,
-                                   # installs deps, runs tester.py
+```sh
+./host/log-console.sh -t        # auto-reconnecting console viewer
 ```
 
-If you have multiple CAN adapters or RP2350 boards plugged in, the
-auto-pick will refuse to guess; pass the device explicitly:
+In another:
 
-```
-sudo ./setup-can.sh /dev/ttyACM2 can0
-python3 tester.py can0
+```sh
+./host/run-ota-cycle.sh 1.1.0 1.2.0 1.3.0
 ```
 
-Teardown (kills slcand and brings down all canX):
-```
-sudo ./setup-can.sh down
-```
+Each cycle:
+1. cmake-builds the firmware at the requested version (TBYB on)
+2. Wraps it in a SUIT envelope (sumo-tool)
+3. Pushes envelope+payload over UDS RequestDownload+TransferData
+4. RoutineControl(activate) — arm trial
+5. ECUReset — bootrom FUB into the new slot
+6. ReadDID(0xF195) — confirm version bumped
+7. Poll 0xF203 — wait for the settle gate to open
+8. RoutineControl(commit) — bootrom commits (erases prior slot's
+   IMAGE_DEF)
 
-For gs_usb-class adapters (CANable Pro), the bridging step is
-unnecessary — they appear as canX directly. Drop in `ip link set
-canX up type can bitrate 500000` instead of the slcand call.
+## Known limitations
 
-Expected:
-
-```
-=== DiagSession(extended) ===
-  ← True session_type=3
-=== ReadDID(0xF187) ===
-  ← 'sumo-rp2350-checkpoint-4a'
-=== ReadDID(0xF195) ===
-  ← '0.1.0-uds-bringup'
-=== ReadDID(0xF18C) ===
-  ← 'tr-sdv-sandbox'
-=== TesterPresent ×3 (suppress positive) ===
-  ← (suppressed)  …  ← (suppressed)  …  ← (suppressed)
-=== DiagSession(default) ===
-  ← True session_type=1
-OK — full UDS round-trip succeeded.
-```
-
-## Sizes
-
-| Section | Bytes |
-|---|---|
-| `.text` | 181,992 |
-| `.bss`  | 30,524 |
-| `.bin`  | 168 KB  |
-| `.uf2`  | 344 KB |
-
-The 4a-only build was 61 KB .text; the +120 KB jump is libsumo +
-libcsuit + zstd_dec + decryptor_psa + the mbedtls subset needed for
-the SUIT receive path.
-
-Of that, `uds_tiny::uds + ::store + ::isotp` total ~12 KB after
-`-Os --gc-sections`. The rest is pico-sdk runtime + USB-CDC + the
-MCP2515 driver.
-
-## SUIT-over-UDS (4b)
-
-```
-cd host
-sudo ./setup-can.sh
-./run-ota.sh                       # default fixture (~1.5 KB)
-./run-ota.sh --reps 21845          # 1 MB plaintext fixture
-```
-
-Expected output:
-
-```
-building fixture envelope (sumo-tool build) ...
-  envelope: 388 B  (/tmp/sumo-rp2350-4b/c4b.suit)
-  payload:  93 B  (/tmp/sumo-rp2350-4b/fw.enc)
-framed: 4 + 388 + 93 = 485 bytes
-expected plaintext SHA-256: 0d0c46f9f9fe646eefe9ee5ca416ee28dfb96dabb4e8e6168610beca3a455620
-using can0
-
-=== DiagSession(programming) ===     ← session_echo=2
-=== RequestDownload(addr=0, size=485) ===     ← max_block=1024
-=== TransferData (chunks of 1024) ===         → sent 485/485
-=== TransferExit ===                  ← ok
-=== polling DID 0xF200 (state) ===   state='K'
-
-device sha256:   0d0c46f9...
-expected sha256: 0d0c46f9...
-
-OK — SUIT-over-UDS pipeline verified end-to-end.
-```
-
-Flow (host's perspective):
-
-1. `RoutineControl(start, 0xFF00 eraseMemory)` — kicks off background
-   erase of the inactive flash slot. Device drives one 4 KB sector
-   per main-loop iteration so CAN polling stays alive.
-2. Poll `ReadDID(0xF200)` until state == `'R'` (ready).
-3. `RequestDownload(size)` — host announces total framed size.
-4. `TransferData` chunks of 256 bytes carrying
-   `[4 B env_len][envelope][payload]` concatenated. Device parses
-   bytes through a state machine — `NEED_HEADER` (4 B), 
-   `NEED_ENVELOPE` (buffered into a 4 KB RAM array), `NEED_PAYLOAD`
-   (streamed through the pipeline below).
-5. `TransferExit` — finalize; state goes `V` (validating) → `K`/`X`.
-6. `ReadDID(0xF201)` — 32-byte SHA-256 of the recovered plaintext.
-
-Streaming pipeline in `NEED_PAYLOAD` (per chunk):
-
-```
-ciphertext bytes
-  → psa_decryptor_update          AES-128-GCM, A128KW-unwrapped CEK
-  → sumo_decompressor_update      zstd, windowLog 10
-  → 256-byte page buffer
-  → flash_range_program           inactive slot, page-by-page
-  → psa_hash_update               running SHA-256
-```
-
-Plaintext **never accumulates in RAM** — it lands directly in the
-inactive flash slot, sized for real firmware. `TransferExit` flushes
-the partial page, `psa_decryptor_finalize` verifies the GCM tag,
-`sumo_decompressor_finalize` verifies the zstd frame ended cleanly,
-and `psa_hash_finish` emits the final SHA-256 to DID `0xF201` for
-host cross-check.
-
-Why `max_block=256` (not 1024 or larger): one ISO-TP message at
-1024 bytes = 1 FF + 146 CFs ≈ 36 ms on the wire at 500 kbit.
-Single-core polled drain (`mcp2515_receive` in the main loop) can
-keep up with that burst most of the time but loses the occasional
-CF, ISO-TP aborts on the resulting SN mismatch, and the host times
-out. 256-byte chunks are 38-frame bursts — comfortably within the
-drain rate. Dual-core split (CAN/ISO-TP on Core 1 with a SPSC
-queue to Core 0) would unlock larger blocks; tracked as a 4c
-follow-up if higher OTA throughput becomes useful.
-
-Status DIDs the host polls:
-
-| DID    | Returns                          |
-|--------|----------------------------------|
-| 0xF200 | one ASCII byte: state name (`I P R H E D V K X` for idle/preparing/ready/header/env/downloading/validating/ok/failed) |
-| 0xF201 | 32-byte SHA-256 of plaintext (zeros until OK) |
-| 0xF202 | uint32 LE bytes-consumed (live progress)  |
-
-## What's not here yet
-
-- **A/B activate + reset** — bootrom partition picker integration;
-  4c.
-- **SecurityAccess** — RequestDownload / TransferData / TransferExit
-  registrations in `main.c` re-register the lib's defaults with
-  `requires_security=false` so 4b focuses on the OTA pipeline shape.
-  Production wants the lib's default `requires_security=true` plus a
-  real seed/key challenge — 4c.
-- **Larger TransferData blocks (1024 / 4096 B)** — needs the CAN/
-  ISO-TP loop on Core 1 with a SPSC queue feeding Core 0. The
-  RP2040 reference's dual-core split is the existing pattern;
-  follow-up for higher OTA throughput.
-- **Native CAN-FD via PIO** — if/when we want to drop the MCP2515 in
-  favour of pure PIO, the `can_hw.c` shim is the only file that
-  changes.
+- **No post-commit rollback**: once `rom_explicit_buy` runs, the
+  bootrom erases the OTHER slot's IMAGE_DEF. The device can no
+  longer fall back to the prior version through the bootrom's A/B
+  picker. To roll back you would have to OTA the prior version
+  again — i.e. roll forward to the same content with a higher
+  version stamp.
+- **No security access**: download / activate / commit are all
+  registered with `requires_security=false` for the demo. Adding
+  seed-key challenge would be a small addition (uds-tiny supports
+  it), but every existing UDS service stays authenticated until
+  you do.
+- **TBYB watchdog is 16.7 s**: the main loop must remain responsive
+  enough to call `watchdog_update()` faster than that. If a future
+  feature ever needs to block longer (e.g. a multi-second flash
+  erase), it must pet the watchdog itself or split the work across
+  multiple iterations the way `ota_prepare_tick` already does.

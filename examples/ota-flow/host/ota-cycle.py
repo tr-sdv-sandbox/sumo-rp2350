@@ -47,7 +47,7 @@ import isotp
 import udsoncan
 from udsoncan.client import Client
 from udsoncan.connections import PythonIsoTpConnection
-from udsoncan.services import DiagnosticSessionControl
+from udsoncan.services import DiagnosticSessionControl, ECUReset
 
 PHYS_TX_ID = 0x18DA42F1
 PHYS_RX_ID = 0x18DAF142
@@ -250,9 +250,10 @@ def push_envelope(client, envelope: pathlib.Path,
         chunk = framed[sent:sent + max_block]
         client.transfer_data(seq, chunk)
         sent += len(chunk)
+        # ISO 14229 §14.4.5.2: blockSequenceCounter wraps FF→00 (no skip).
+        # uds-tiny on the device increments a uint8_t through zero, so we
+        # must do the same.
         seq = (seq + 1) & 0xFF
-        if seq == 0:
-            seq = 1
 
     client.request_transfer_exit()
     poll_did(client, 0xF200, expected="S", timeout=30)
@@ -260,16 +261,33 @@ def push_envelope(client, envelope: pathlib.Path,
 
 def activate_and_reconnect(client, conn, bus, iface: str
                            ) -> tuple[Client, PythonIsoTpConnection, object]:
-    """Send activate, then close + reopen the connection because the
-    device FUB-reboots and the ISO-TP state has to be reset."""
+    """Two-step automotive flow:
+      1. RoutineControl 0xF001 (activate) — arms trial state in
+         non-volatile storage. Device returns positive response, does
+         NOT reboot. Tester can stage further ECUs at this point.
+      2. ECUReset 0x11 (hardReset) — tester signals "now is safe to
+         reboot". Device's ecu_reset_hook reads the armed trial flag
+         and FUB-reboots into the staged slot.
+    The ECUReset response may be cut short by the actual reboot; we
+    catch the timeout and treat it as success."""
     print("  activate (RoutineControl 0xF001) …")
+    client.start_routine(0xF001)              # device must respond OK
+    print("    (armed; device still in old slot)")
+
+    # Optional: confirm the OTA-state DID still says S after activate.
+    st = client.read_data_by_identifier(0xF200) \
+               .service_data.values[0xF200]
+    if st != "S":
+        print(f"    WARN: post-activate state = {st!r} (expected 'S')")
+
+    print("  ECUReset (UDS 0x11 hardReset) …")
     try:
-        client.start_routine(0xF001)
+        client.ecu_reset(ECUReset.ResetType.hardReset)
     except Exception as e:
-        # The device reboots before its response can complete in some
-        # timing paths. Treat that as success and move on.
-        print(f"    (activate response interrupted: {e})")
-    # Tear down and wait for the device to come back.
+        # The device reboots before its 0x51 response can drain — we
+        # expect this. Treat the timeout as success.
+        print(f"    (ECUReset response interrupted: {e})")
+
     try: client.close()
     except Exception: pass
     try: bus.shutdown()
@@ -286,6 +304,23 @@ def activate_and_reconnect(client, conn, bus, iface: str
 
 
 def commit(client) -> None:
+    """Wait for the device's settle period to elapse, then commit.
+
+    The device returns NRC 0x22 (conditionsNotCorrect) for any commit
+    request received before its settle deadline (TRIAL_SETTLE_MS,
+    default 10 s). We poll DID 0xF203 (1 = settle elapsed) so we
+    don't burn a full 30-s timeout on the first attempt."""
+    print("  commit: waiting for trial settle (DID 0xF203 → 1)…")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        v = client.read_data_by_identifier(0xF203) \
+                  .service_data.values[0xF203]
+        if v == 1:
+            break
+        time.sleep(1.0)
+    else:
+        sys.exit("settle period never elapsed; device may be wedged")
+
     print("  commit (RoutineControl 0xF002) …")
     client.start_routine(0xF002)
     poll_did(client, 0xF200, expected="K", timeout=10)
@@ -306,10 +341,24 @@ def main() -> int:
     iface = args.iface or autopick_can_iface()
     udsoncan.setup_logging()
 
+    # Build all artifacts FIRST so the long cmake/sumo-tool work
+    # doesn't idle the UDS session past its S3 timer (5 s default,
+    # well shorter than a per-version build). With everything cached
+    # we can race through the UDS sequence with no idle gaps.
+    artifacts = []
+    for i, version in enumerate(args.versions):
+        print(f"══ pre-build {i+1}/{len(args.versions)}: v{version} ══")
+        fw_bin = build_firmware(version, args.verbose)
+        print(f"  fw  : {fw_bin.stat().st_size} B")
+        envelope, payload = build_envelope(version, fw_bin, args.verbose)
+        print(f"  env : {envelope.stat().st_size} B   "
+              f"payload : {payload.stat().st_size} B")
+        artifacts.append((version, envelope, payload))
+
     conn, bus = make_connection(iface)
     client = Client(conn, config=make_client_config())
     client.open()
-    print(f"using {iface}")
+    print(f"\nusing {iface}")
 
     print("\n=== DiagSession(programming) ===")
     r = client.change_session(
@@ -325,17 +374,15 @@ def main() -> int:
                    .service_data.values[0xF204]
     print(f"  running version={cur_v!r}  state={cur_st!r}  last_boot={cur_bt!r}")
 
-    for i, version in enumerate(args.versions):
-        print(f"\n══ cycle {i+1}/{len(args.versions)}: → v{version} ══")
+    for i, (version, envelope, payload) in enumerate(artifacts):
+        print(f"\n══ cycle {i+1}/{len(artifacts)}: → v{version} ══")
 
-        print(f"  building firmware v{version}")
-        fw_bin = build_firmware(version, args.verbose)
-        print(f"    {fw_bin.stat().st_size} B  ({fw_bin})")
-
-        print(f"  building SUIT envelope")
-        envelope, payload = build_envelope(version, fw_bin, args.verbose)
-        print(f"    envelope={envelope.stat().st_size} B  "
-              f"payload={payload.stat().st_size} B")
+        # Re-affirm the session at the start of every cycle. Activation
+        # reboots the device and resets the session to default, plus
+        # belt-and-suspenders against any S3 timeout from polling
+        # latency between cycles.
+        client.change_session(
+            DiagnosticSessionControl.Session.programmingSession)
 
         print(f"  pushing OTA")
         push_envelope(client, envelope, payload)

@@ -7,10 +7,15 @@
     "",
     "Layout on a 4 MB Waveshare RP2350-CAN:",
     "  0x000000 ..0x0FFFFF (1 MB)  unpartitioned (free flash)",
-    "  0x100000 ..0x1FFFFF (1 MB)  App-A (id 1)",
-    "  0x200000 ..0x2FFFFF (1 MB)  App-B (id 2, linked A-pair of id 1)",
+    "  0x100000 ..0x1FFFFF (1 MB)  App-A (id 0)",
+    "  0x200000 ..0x2FFFFF (1 MB)  App-B (id 0, linked A-pair of A)",
     "  0x300000 ..0x3EFFFF        unpartitioned",
-    "  0x3F0000 ..0x3FFFFF (64 KB) LittleFS-KV (id 3)"
+    "  0x3F0000 ..0x3FFFFF (64 KB) LittleFS-KV (id 1)",
+    "",
+    "A and B both carry id=0 (matching the pico-examples ota_update",
+    "reference). The bootrom uses the `link` field to identify the",
+    "A/B relationship; the `id` doesn't have to differ between siblings",
+    "and the SDK examples deliberately keep them the same."
   ],
   "version": [1, 0],
   "unpartitioned": {
@@ -21,7 +26,7 @@
   "partitions": [
     {
       "name": "App-A",
-      "id": 1,
+      "id": 0,
       "start": "1024K",
       "size":  "1024K",
       "families": ["rp2350-arm-s"],
@@ -29,16 +34,16 @@
     },
     {
       "name": "App-B",
-      "id": 2,
+      "id": 0,
       "start": "2048K",
       "size":  "1024K",
       "families": ["rp2350-arm-s"],
       "permissions": {"secure": "rw", "nonsecure": "r", "bootloader": "rw"},
-      "link": ["a", 1]
+      "link": ["a", 0]
     },
     {
       "name": "LittleFS-KV",
-      "id": 3,
+      "id": 1,
       "start": "4032K",
       "size":  "64K",
       "families": ["data"],
