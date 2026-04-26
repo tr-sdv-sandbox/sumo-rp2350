@@ -15,10 +15,13 @@ set(PICO_BOARD pico2 CACHE STRING "Pico board target")
 set(PICO_PLATFORM rp2350 CACHE STRING "Pico platform")
 pico_sdk_init()
 
-# Sibling components — paths assume the conventional sumo-workspace
-# layout: examples/minimal/ → ../.. → sumo-rp2350 → ../libsumo.
-set(SUMO_RP2350_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..)
-set(LIBSUMO_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/../../../libsumo)
+# Conventional layout: ~/dev/sumo-rp2350/ and ~/dev/sumo-workspace/
+# are siblings on disk. Override either path on the cmake command line
+# (-DLIBSUMO_DIR=...) if you've cloned them elsewhere.
+set(SUMO_RP2350_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    CACHE PATH "Path to the sumo-rp2350 binding (this repo's root)")
+set(LIBSUMO_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/../../../sumo-workspace/components/libsumo
+    CACHE PATH "Path to libsumo's onboard tree")
 
 # libsumo's onboard library has a Linux-only fall-through that pulls
 # in libcurl. The Pico build doesn't have/need it, so wire just the

@@ -43,6 +43,22 @@ void                 sumo_rp2350_free        (sumo_rp2350_t *r);
   integrator's app does the validation and re-flashing in user space
   before letting the device reset.
 
+## Layout
+
+`sumo-rp2350` lives next to the core `sumo-workspace`, **not** inside
+it — the workspace tracks the host-side stack (libsumo, sumo-rs,
+SOVDd, …) that gets deployed together on the dev rig; this binding
+targets a specific embedded board with its own toolchain and has no
+role on the host.
+
+```
+~/dev/
+├── sumo-workspace/        ← submodule meta-repo (libsumo, sumo-rs, …)
+│   └── components/
+│       └── libsumo/       ← linked from here
+└── sumo-rp2350/           ← this repo (sibling, not a workspace submodule)
+```
+
 ## Building
 
 `sumo-rp2350` is consumed from a Pico-SDK app:
@@ -55,7 +71,7 @@ project(my_ecu C CXX ASM)
 pico_sdk_init()
 
 add_subdirectory(../sumo-workspace/components/libsumo libsumo)
-add_subdirectory(../sumo-workspace/components/sumo-rp2350 sumo-rp2350)
+add_subdirectory(../sumo-rp2350 sumo-rp2350)
 
 add_executable(my_ecu main.c)
 target_link_libraries(my_ecu
