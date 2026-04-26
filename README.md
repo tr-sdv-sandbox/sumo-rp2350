@@ -45,18 +45,16 @@ void                 sumo_rp2350_free        (sumo_rp2350_t *r);
 
 ## Layout
 
-`sumo-rp2350` lives next to the core `sumo-workspace`, **not** inside
-it — the workspace tracks the host-side stack (libsumo, sumo-rs,
-SOVDd, …) that gets deployed together on the dev rig; this binding
-targets a specific embedded board with its own toolchain and has no
-role on the host.
+Both `libsumo` and `sumo-rp2350` are standalone repos that live next
+to each other on disk. The `sumo-workspace` meta-repo tracks the
+host-deployed stack (sumo-rs, SOVDd, sumo-vm-mgr, …); libsumo and the
+hardware-target bindings are independent consumers.
 
 ```
 ~/dev/
-├── sumo-workspace/        ← submodule meta-repo (libsumo, sumo-rs, …)
-│   └── components/
-│       └── libsumo/       ← linked from here
-└── sumo-rp2350/           ← this repo (sibling, not a workspace submodule)
+├── libsumo/               ← portable C99 SUIT library
+├── sumo-rp2350/           ← this repo (Pico-SDK binding for libsumo)
+└── sumo-workspace/        ← host-side stack meta-repo (separate concern)
 ```
 
 ## Building
@@ -70,7 +68,7 @@ include(pico_sdk_import.cmake)
 project(my_ecu C CXX ASM)
 pico_sdk_init()
 
-add_subdirectory(../sumo-workspace/components/libsumo libsumo)
+add_subdirectory(../libsumo libsumo)
 add_subdirectory(../sumo-rp2350 sumo-rp2350)
 
 add_executable(my_ecu main.c)
