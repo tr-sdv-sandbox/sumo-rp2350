@@ -132,8 +132,10 @@ static const uint8_t kKek[16] = {
 
 /* ── Flash layout (matches examples/minimal). 4 MB Waveshare board. */
 static const sumo_rp2350_config_t kFlashCfg = {
+    /* Matches partition_table.json: A at 0x100000+1MB, B at
+     * 0x200000+1MB, kv at 0x3F0000+64KB. */
     .fs_offset     = 0x003F0000,
-    .fs_size       = 0x00004000,
+    .fs_size       = 0x00010000,
     .slot_a_offset = 0x00100000,
     .slot_a_size   = 0x00100000,
     .slot_b_offset = 0x00200000,

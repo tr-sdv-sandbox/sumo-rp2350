@@ -1,0 +1,48 @@
+{
+  "$schema": "../../../picotool/json/schemas/partition-table-schema.json",
+  "//": [
+    "RP2350 partition layout for the ota-flow demo. The bootrom",
+    "reads this table to pick between A and B at boot, ranking by",
+    "the IMAGE_DEF version baked into each slot.",
+    "",
+    "Layout on a 4 MB Waveshare RP2350-CAN:",
+    "  0x000000 ..0x0FFFFF (1 MB)  unpartitioned (free flash)",
+    "  0x100000 ..0x1FFFFF (1 MB)  App-A (id 1)",
+    "  0x200000 ..0x2FFFFF (1 MB)  App-B (id 2, linked A-pair of id 1)",
+    "  0x300000 ..0x3EFFFF        unpartitioned",
+    "  0x3F0000 ..0x3FFFFF (64 KB) LittleFS-KV (id 3)"
+  ],
+  "version": [1, 0],
+  "unpartitioned": {
+    "//": "absolute family is required by the RP2350-E10 erratum fix",
+    "families": ["absolute", "rp2350-arm-s", "data"],
+    "permissions": {"secure": "rw", "nonsecure": "r", "bootloader": "rw"}
+  },
+  "partitions": [
+    {
+      "name": "App-A",
+      "id": 1,
+      "start": "1024K",
+      "size":  "1024K",
+      "families": ["rp2350-arm-s"],
+      "permissions": {"secure": "rw", "nonsecure": "r", "bootloader": "rw"}
+    },
+    {
+      "name": "App-B",
+      "id": 2,
+      "start": "2048K",
+      "size":  "1024K",
+      "families": ["rp2350-arm-s"],
+      "permissions": {"secure": "rw", "nonsecure": "r", "bootloader": "rw"},
+      "link": ["a", 1]
+    },
+    {
+      "name": "LittleFS-KV",
+      "id": 3,
+      "start": "4032K",
+      "size":  "64K",
+      "families": ["data"],
+      "permissions": {"secure": "rw", "nonsecure": "r", "bootloader": "rw"}
+    }
+  ]
+}
