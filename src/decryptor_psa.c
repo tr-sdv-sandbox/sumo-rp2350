@@ -1,5 +1,5 @@
 /**
- * @file decryptor_psa.c
+ * @file src/decryptor_psa.c
  * @brief Streaming AES-128-GCM decryption + A128KW key unwrap, all
  *        through PSA Crypto + mbedtls's NIST_KW. RP2350-targeted.
  *
@@ -9,8 +9,8 @@
  * AES-KW (PSA Crypto 1.x doesn't expose a clean key-wrap algorithm).
  *
  * No ECDH-ES path — that's ~+50 KB of crypto. A128KW is enough for the
- * "device with a pre-provisioned KEK" deployment shape this checkpoint
- * is showing off.
+ * "device with a pre-provisioned KEK" deployment shape these
+ * checkpoints are showing off.
  *
  * The CBOR helper `parse_cose_encrypt` is duplicated from libsumo's
  * decryptor.c (one of those things to factor into a shared file later
@@ -18,7 +18,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#include "decryptor_psa.h"
+#include "sumo/decryptor_psa.h"
 
 #include <stdint.h>
 #include <stdlib.h>

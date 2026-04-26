@@ -1,8 +1,15 @@
-# examples/uds-server — checkpoint 4a
+# examples/uds-server — checkpoints 4a + 4b
 
-Minimal UDS-on-CAN server running on a Waveshare RP2350-CAN. Goal of
-this checkpoint: prove the full CAN → ISO-TP → UDS stack works on
-RP2350 against a Linux-host tester. SUIT integration lands in 4b.
+UDS-on-CAN server running on a Waveshare RP2350-CAN. Two layered
+demos:
+
+- **4a** — bare UDS bring-up (DiagSession + ECUReset + ReadDID +
+  TesterPresent), driven by `host/run-test.sh`.
+- **4b** — SUIT-over-UDS download: host pushes a SUIT envelope+payload
+  over UDS RequestDownload + TransferData + TransferExit, device
+  validates the envelope, decrypts and decompresses the payload, and
+  exposes the recovered plaintext's SHA-256 via DID `0xF201`. Driven
+  by `host/run-ota.sh`. A/B activate + reset is deferred to 4c.
 
 ## What's running on the device
 
@@ -126,24 +133,93 @@ OK — full UDS round-trip succeeded.
 
 | Section | Bytes |
 |---|---|
-| `.text` | 61,232 |
-| `.bss`  | 12,956 |
-| `.bin`  | 54 KB  |
-| `.uf2`  | 109 KB |
+| `.text` | 181,992 |
+| `.bss`  | 30,524 |
+| `.bin`  | 168 KB  |
+| `.uf2`  | 344 KB |
+
+The 4a-only build was 61 KB .text; the +120 KB jump is libsumo +
+libcsuit + zstd_dec + decryptor_psa + the mbedtls subset needed for
+the SUIT receive path.
 
 Of that, `uds_tiny::uds + ::store + ::isotp` total ~12 KB after
 `-Os --gc-sections`. The rest is pico-sdk runtime + USB-CDC + the
 MCP2515 driver.
 
+## SUIT-over-UDS (4b)
+
+```
+cd host
+sudo ./setup-can.sh
+./run-ota.sh                       # builds fixture, pushes via UDS
+```
+
+Expected output:
+
+```
+building fixture envelope (sumo-tool build) ...
+  envelope: 388 B  (/tmp/sumo-rp2350-4b/c4b.suit)
+  payload:  93 B  (/tmp/sumo-rp2350-4b/fw.enc)
+framed: 4 + 388 + 93 = 485 bytes
+expected plaintext SHA-256: 0d0c46f9f9fe646eefe9ee5ca416ee28dfb96dabb4e8e6168610beca3a455620
+using can0
+
+=== DiagSession(programming) ===     ← session_echo=2
+=== RequestDownload(addr=0, size=485) ===     ← max_block=1024
+=== TransferData (chunks of 1024) ===         → sent 485/485
+=== TransferExit ===                  ← ok
+=== polling DID 0xF200 (state) ===   state='K'
+
+device sha256:   0d0c46f9...
+expected sha256: 0d0c46f9...
+
+OK — SUIT-over-UDS pipeline verified end-to-end.
+```
+
+App-level framing the host script applies before pushing:
+
+```
++----------------+-----------------+-------------------+
+| env_len (4 B   | envelope        | payload           |
+|  LE uint32)    |  (manifest+sig) | (encrypted+zstd)  |
++----------------+-----------------+-------------------+
+```
+
+Device state machine walks bytes through three states —
+`NEED_HEADER` (parse 4 B env_len), `NEED_ENVELOPE` (buffer N bytes
+into a 4 KB RAM staging area), `NEED_PAYLOAD` (stream to inactive
+flash slot via `platform_rp2350.c`'s page-by-page write_fn). At
+TransferExit:
+
+1. `sumo_validate_envelope(...)` — ECDSA-P256 manifest signature.
+2. `sumo_manifest_encryption_info(...)` — pulls the `COSE_Encrypt`
+   bytes out of the validated manifest (libsumo accessor added in
+   the same commit).
+3. `psa_decryptor_create + update + finalize` — reads ciphertext
+   directly from XIP-mapped inactive slot, AES-128-GCM streaming.
+4. `sumo_decompressor_*` — zstd into a 2 KB RAM plaintext buffer.
+5. `psa_hash_compute(SHA_256, ...)` — exposed at DID `0xF201`.
+
+Status DIDs the host polls:
+
+| DID    | Returns                          |
+|--------|----------------------------------|
+| 0xF200 | one ASCII byte: state name (`I H E P V K X` for idle/header/env/payload/validating/ok/failed) |
+| 0xF201 | 32-byte SHA-256 of plaintext (zeros until OK) |
+| 0xF202 | uint32 LE bytes-consumed (live progress)  |
+
 ## What's not here yet
 
-- **SUIT** — TransferData / TransferExit / RoutineControl callbacks
-  routed into libsumo. Lands in checkpoint 4b.
-- **A/B activate + reset** — uses the bootrom partition picker;
-  arrives with 4c.
-- **SecurityAccess** — the lib supports 0x27 with seed/key out of the
-  box; no app-side hookup yet because the bench tester doesn't need
-  it.
+- **A/B activate + reset** — bootrom partition picker integration;
+  4c.
+- **Plaintext-to-flash for real-firmware sizes** — 4b's plaintext
+  lands in a 2 KB RAM buffer; works for the ~1.6 KB fixture but won't
+  for MB-scale firmware. Fixed in 4c with proper bootloader handoff.
+- **SecurityAccess** — RequestDownload / TransferData / TransferExit
+  registrations in `main.c` re-register the lib's defaults with
+  `requires_security=false` so 4b focuses on the OTA pipeline shape.
+  Production wants the lib's default `requires_security=true` plus a
+  real seed/key challenge — 4c.
 - **Native CAN-FD via PIO** — if/when we want to drop the MCP2515 in
   favour of pure PIO, the `can_hw.c` shim is the only file that
   changes.

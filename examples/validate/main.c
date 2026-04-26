@@ -44,7 +44,7 @@
 #include "sumo/validator.h"
 #include "sumo/decompressor.h"
 
-#include "decryptor_psa.h"
+#include "sumo/decryptor_psa.h"
 
 #ifndef DIAG_LED_PIN
 #  ifdef PICO_DEFAULT_LED_PIN

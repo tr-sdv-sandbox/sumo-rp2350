@@ -1,12 +1,16 @@
 /**
- * @file decryptor_psa.h
- * @brief Minimal PSA-Crypto-backed streaming AEAD decryptor for the
- *        validate example. See decryptor_psa.c for design notes.
+ * @file sumo/decryptor_psa.h
+ * @brief Minimal PSA-Crypto-backed streaming AEAD decryptor for
+ *        sumo-rp2350 firmware. Pairs with libsumo's manifest
+ *        decoder (`sumo_manifest_encryption_info`) to decrypt SUIT
+ *        payloads on-device. Used by examples/validate (baked-in
+ *        fixtures) and examples/uds-server (SUIT-over-UDS receive).
+ *        See src/decryptor_psa.c for design notes.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-#ifndef DECRYPTOR_PSA_H
-#define DECRYPTOR_PSA_H
+#ifndef SUMO_DECRYPTOR_PSA_H
+#define SUMO_DECRYPTOR_PSA_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -60,4 +64,4 @@ void psa_decryptor_free(psa_decryptor_t *d);
 #ifdef __cplusplus
 }
 #endif
-#endif /* DECRYPTOR_PSA_H */
+#endif /* SUMO_DECRYPTOR_PSA_H */

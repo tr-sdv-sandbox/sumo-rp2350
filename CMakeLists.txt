@@ -18,6 +18,7 @@ add_library(sumo-rp2350 INTERFACE)
 
 target_sources(sumo-rp2350 INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/platform_rp2350.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/decryptor_psa.c
     ${LFS_DIR}/lfs.c
     ${LFS_DIR}/lfs_util.c)
 

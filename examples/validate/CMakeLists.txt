@@ -142,7 +142,10 @@ target_compile_options(sumo_onboard PRIVATE -Os -ffunction-sections -fdata-secti
 add_subdirectory(${SUMO_RP2350_DIR} sumo-rp2350 EXCLUDE_FROM_ALL)
 
 # ── App ─────────────────────────────────────────────────────────────
-add_executable(sumo_rp2350_validate main.c decryptor_psa.c)
+# decryptor_psa.{c,h} now lives in sumo-rp2350/src/ and is exposed via
+# the `sumo-rp2350` INTERFACE library (added below as a link_libraries
+# dep), so we don't compile it locally any more.
+add_executable(sumo_rp2350_validate main.c)
 target_include_directories(sumo_rp2350_validate PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 
