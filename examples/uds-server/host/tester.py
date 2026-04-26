@@ -21,10 +21,12 @@ examples/uds-server/main.c:
 Requires:  python-can, can-isotp, udsoncan
 Install:   pip install -r requirements.txt
 
-Usage:     python3 tester.py <can_iface>
-Example:   python3 tester.py can0
+Usage:     python3 tester.py [<can_iface>]
+Example:   python3 tester.py            # auto-pick the lone canX
+           python3 tester.py can0       # explicit
 """
 import argparse
+import pathlib
 import sys
 import time
 
@@ -34,6 +36,17 @@ import udsoncan
 from udsoncan.client import Client
 from udsoncan.connections import PythonIsoTpConnection
 from udsoncan.services import DiagnosticSessionControl, ReadDataByIdentifier, TesterPresent
+
+
+def autopick_can_iface() -> str:
+    """Find the lone canX in /sys/class/net. Bail if 0 or >1."""
+    ifaces = sorted(p.name for p in pathlib.Path("/sys/class/net").iterdir()
+                    if p.name.startswith("can"))
+    if not ifaces:
+        sys.exit("no canX interface present — run `sudo ./setup-can.sh` first")
+    if len(ifaces) > 1:
+        sys.exit(f"multiple CAN interfaces: {ifaces} — pass one explicitly")
+    return ifaces[0]
 
 
 PHYS_TX_ID = 0x18DA42F1   # host (tester F1) → ECU (42) — physical req
@@ -58,8 +71,12 @@ def make_connection(iface: str) -> PythonIsoTpConnection:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("iface", help="SocketCAN interface (e.g. can0)")
+    ap.add_argument("iface", nargs="?", default=None,
+                    help="SocketCAN interface (e.g. can0). "
+                         "Defaults to the lone canX present.")
     args = ap.parse_args()
+    iface = args.iface or autopick_can_iface()
+    print(f"using {iface}")
 
     udsoncan.setup_logging()
 
@@ -71,7 +88,7 @@ def main() -> int:
     }
     config["request_timeout"] = 2.0
 
-    conn = make_connection(args.iface)
+    conn = make_connection(iface)
     with Client(conn, config=config) as client:
         print("\n=== DiagSession(extended) ===")
         r = client.change_session(DiagnosticSessionControl.Session.extendedDiagnosticSession)

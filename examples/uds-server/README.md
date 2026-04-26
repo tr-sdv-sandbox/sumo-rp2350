@@ -75,22 +75,34 @@ request prints a `UDS req: ...` / `UDS rsp: ...` line.
 
 ## Bench loop with a Linux host
 
-You need a USB-CAN adapter on your Linux box (CANable Pro / other
-gs_usb-class works out of the box; PEAK-USB / Kvaser need their
-own setup). Wire H↔H, L↔L, plus one termination resistor at the
-far end (the Waveshare board has a selectable 120 Ω terminator).
+Needs a USB-CAN adapter (slcan-style — CANable v1, generic dongles,
+etc.). Wire H↔H, L↔L, plus one termination resistor at the far end
+(the Waveshare board has a selectable 120 Ω terminator).
 
 ```
 cd host
-sudo ./setup-can.sh                # bring up can0 @ 500 kbps
+sudo ./setup-can.sh                # auto-picks the non-Pico ttyACM,
+                                   # bridges via slcand to can0 @ 500k
 pip install -r requirements.txt
+python3 tester.py                  # auto-picks the lone canX
+```
+
+If you have multiple CAN adapters or RP2350 boards plugged in, the
+auto-pick will refuse to guess; pass the device explicitly:
+
+```
+sudo ./setup-can.sh /dev/ttyACM2 can0
 python3 tester.py can0
 ```
 
-To tear down:
+Teardown (kills slcand and brings down all canX):
 ```
-sudo ./setup-can.sh can0 down
+sudo ./setup-can.sh down
 ```
+
+For gs_usb-class adapters (CANable Pro), the bridging step is
+unnecessary — they appear as canX directly. Drop in `ip link set
+canX up type can bitrate 500000` instead of the slcand call.
 
 Expected:
 
