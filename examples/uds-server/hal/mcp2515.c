@@ -247,24 +247,42 @@ bool mcp2515_init(void) {
 }
 
 /* ── Transmit ─────────────────────────────────────────────────────── */
+/*
+ * Single-TXB-busy-wait strategy (TXB0 only).
+ *
+ * The MCP2515 has three TX buffers and, when more than one is loaded
+ * simultaneously, transmits the highest-numbered first among equal-
+ * priority buffers (datasheet §3.6). With our single-core polled main
+ * loop, ISO-TP CFs are pushed back-to-back fast enough that all three
+ * TXBs end up loaded before TXB0 has finished, and the second/third
+ * CFs land on the wire out of order — the receiver then NAKs on the
+ * sequence-number check. (The RP2040 reference dodges this by virtue
+ * of its dual-core split, which paces TX naturally.)
+ *
+ * Quick fix: always use TXB0, busy-wait for TXREQ to clear before
+ * writing the next frame. Cost is ~250 µs blocking per frame at
+ * 500 kbps — invisible at our throughput. The proper fix is
+ * interrupt-driven TX with a software FIFO; tracked in
+ * docs/tx-irq-plan.md.
+ */
 
 bool mcp2515_send(const can_frame_t *frame) {
-    /* Find a free TX buffer */
-    static const uint8_t txb_ctrl[] = { REG_TXB0CTRL, REG_TXB1CTRL, REG_TXB2CTRL };
-    static const uint8_t txb_sidh[] = { REG_TXB0SIDH, REG_TXB1SIDH, REG_TXB2SIDH };
-    static const uint8_t txb_d0[]   = { REG_TXB0D0,   REG_TXB1D0,   REG_TXB2D0   };
-    static const uint8_t txb_dlc[]  = { REG_TXB0DLC,  REG_TXB1DLC,  REG_TXB2DLC  };
+    static const uint8_t txb_ctrl[] = { REG_TXB0CTRL };
+    static const uint8_t txb_sidh[] = { REG_TXB0SIDH };
+    static const uint8_t txb_d0[]   = { REG_TXB0D0   };
+    static const uint8_t txb_dlc[]  = { REG_TXB0DLC  };
 
-    int buf = -1;
-    for (int i = 0; i < 3; i++) {
-        if (!(mcp2515_read_reg(txb_ctrl[i]) & TXB_TXREQ)) {
-            buf = i;
-            break;
-        }
+    /* Busy-wait until TXB0 is idle. Bounded by ~250 µs (one CAN frame
+     * worth at 500 kbps) under healthy bus conditions; ~5 ms cap to
+     * surface a stuck bus rather than block forever. */
+    const int TIMEOUT_US = 5000;
+    int waited = 0;
+    while (mcp2515_read_reg(txb_ctrl[0]) & TXB_TXREQ) {
+        if (waited >= TIMEOUT_US) return false;
+        sleep_us(50);
+        waited += 50;
     }
-    if (buf < 0) {
-        return false; /* All TX buffers busy */
-    }
+    int buf = 0;
 
     /* Load ID into SIDH/SIDL/EID8/EID0 */
     if (frame->is_ext) {

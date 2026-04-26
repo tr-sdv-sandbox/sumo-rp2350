@@ -83,8 +83,8 @@ etc.). Wire H↔H, L↔L, plus one termination resistor at the far end
 cd host
 sudo ./setup-can.sh                # auto-picks the non-Pico ttyACM,
                                    # bridges via slcand to can0 @ 500k
-pip install -r requirements.txt
-python3 tester.py                  # auto-picks the lone canX
+./run-test.sh                      # creates host/.venv on first run,
+                                   # installs deps, runs tester.py
 ```
 
 If you have multiple CAN adapters or RP2350 boards plugged in, the

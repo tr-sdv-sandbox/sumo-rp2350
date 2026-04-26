@@ -59,10 +59,12 @@ def make_connection(iface: str) -> PythonIsoTpConnection:
         isotp.AddressingMode.Normal_29bits,
         txid=PHYS_TX_ID, rxid=PHYS_RX_ID,
     )
-    layer = isotp.NotifierBasedCanStack(
-        bus, isotp.Notifier(bus), addr,
+    # CanStack manages its own RX thread; `udsoncan` calls
+    # layer.start()/stop() via PythonIsoTpConnection.open()/close().
+    layer = isotp.CanStack(
+        bus, address=addr,
         params={
-            "tx_data_min_length": 8,   # classic CAN frames
+            "tx_data_min_length": 8,   # classic CAN frames, padded
             "tx_padding": 0xCC,
         },
     )
@@ -80,23 +82,44 @@ def main() -> int:
 
     udsoncan.setup_logging()
 
+    # Variable-length ASCII codec — udsoncan's AsciiCodec is fixed-
+    # length, but our DID values vary. Returning ReadAllRemainingData
+    # from __len__ tells udsoncan "this DID consumes all remaining
+    # response bytes".
+    class VarAscii(udsoncan.DidCodec):
+        def encode(self, val):
+            return val.encode("ascii")
+
+        def decode(self, payload):
+            return payload.decode("ascii", errors="replace")
+
+        def __len__(self):
+            raise udsoncan.DidCodec.ReadAllRemainingData
+
     config = dict(udsoncan.configs.default_client_config)
     config["data_identifiers"] = {
-        0xF187: udsoncan.AsciiCodec(64),   # spare-part
-        0xF195: udsoncan.AsciiCodec(64),   # sw version
-        0xF18C: udsoncan.AsciiCodec(64),   # vendor
+        0xF187: VarAscii(),   # spare-part
+        0xF195: VarAscii(),   # sw version
+        0xF18C: VarAscii(),   # vendor
     }
+    # Device advertises P2=50 ms in DiagSession but slcan adds ~10 ms
+    # of per-frame USB-CDC latency, so a 5-frame multi-frame ReadDID
+    # response easily exceeds 50 ms. Ignore the device's advertised
+    # P2 and rely on request_timeout for the wall-clock budget.
+    config["use_server_timing"] = False
     config["request_timeout"] = 2.0
+    config["p2_timeout"] = 1.0
+    config["p2_star_timeout"] = 5.0
 
     conn = make_connection(iface)
     with Client(conn, config=config) as client:
         print("\n=== DiagSession(extended) ===")
         r = client.change_session(DiagnosticSessionControl.Session.extendedDiagnosticSession)
-        print(f"  ← {r.positive!r} session_type={r.service_data.session_type}")
+        print(f"  ← session_echo={r.service_data.session_echo}")
 
         for did in (0xF187, 0xF195, 0xF18C):
             print(f"\n=== ReadDID(0x{did:04X}) ===")
-            r = client.read_data_by_identifier([did])
+            r = client.read_data_by_identifier(did)
             val = r.service_data.values[did]
             print(f"  ← '{val}'")
 
@@ -108,7 +131,7 @@ def main() -> int:
 
         print("\n=== DiagSession(default) ===")
         r = client.change_session(DiagnosticSessionControl.Session.defaultSession)
-        print(f"  ← {r.positive!r} session_type={r.service_data.session_type}")
+        print(f"  ← session_echo={r.service_data.session_echo}")
 
     print("\nOK — full UDS round-trip succeeded.")
     return 0
