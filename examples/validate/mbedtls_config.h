@@ -18,6 +18,14 @@
 #define MBEDTLS_SHA256_C
 #define MBEDTLS_MD_C
 
+/* Symmetric crypto for checkpoint 2 (decryption).
+ * AES-GCM goes through PSA Crypto. AES-KW (A128KW) doesn't have a
+ * clean PSA path in 1.x, so we drop down to mbedtls's NIST_KW which
+ * needs MBEDTLS_CIPHER_C + MBEDTLS_NIST_KW_C. */
+#define MBEDTLS_GCM_C
+#define MBEDTLS_CIPHER_C
+#define MBEDTLS_NIST_KW_C
+
 /* ECDSA + supporting math. */
 #define MBEDTLS_ECDSA_C
 #define MBEDTLS_ECP_C

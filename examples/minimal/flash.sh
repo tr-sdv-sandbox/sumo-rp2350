@@ -87,12 +87,26 @@ EOF
 fi
 
 # ── Wait for new firmware's USB-CDC, attach ──────────────────────
-echo "==> Waiting for USB-CDC console"
+# Filter by Raspberry Pi VID (0x2E8A) so we don't grab a CAN-USB
+# adapter or some other ttyACM that happens to be on the host.
+pick_pico_serial() {
+    for d in /dev/ttyACM*; do
+        [ -e "$d" ] || continue
+        vid=$(udevadm info -q property "$d" 2>/dev/null \
+              | sed -n 's/^ID_VENDOR_ID=//p')
+        if [ "$vid" = "2e8a" ]; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+echo "==> Waiting for USB-CDC console (filtering for VID 2e8a)"
 SERIAL=""
 for _ in $(seq 1 30); do
-    SERIAL=$(ls -t /dev/ttyACM* 2>/dev/null | head -n1 || true)
+    SERIAL=$(pick_pico_serial || true)
     if [ -n "$SERIAL" ]; then
-        # Allow the device a moment to actually open the endpoint.
         sleep 0.5
         break
     fi

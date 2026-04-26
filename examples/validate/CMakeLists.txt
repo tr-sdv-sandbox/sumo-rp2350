@@ -105,7 +105,17 @@ target_compile_options(sumo_onboard PRIVATE -Os -ffunction-sections -fdata-secti
 add_subdirectory(${SUMO_RP2350_DIR} sumo-rp2350 EXCLUDE_FROM_ALL)
 
 # ── App ─────────────────────────────────────────────────────────────
-add_executable(sumo_rp2350_validate main.c)
+add_executable(sumo_rp2350_validate main.c decryptor_psa.c)
+target_include_directories(sumo_rp2350_validate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Pico-sdk default stacks are 2 KB per core, allocated inside
+# SCRATCH_Y (4 KB total). 4 KB is the most we can take without
+# moving the stack out of SCRATCH_Y. PSA + ECDSA verify can spike
+# to ~3 KB transient stack, so 4 KB removes overflow as a suspect
+# while we're chasing silent hangs.
+target_compile_definitions(sumo_rp2350_validate PRIVATE
+    PICO_STACK_SIZE=0x1000)
 
 target_link_libraries(sumo_rp2350_validate
     pico_stdlib
