@@ -87,18 +87,55 @@ target_compile_definitions(csuit PUBLIC
 target_link_libraries(csuit PUBLIC qcbor t_cose)
 target_compile_options(csuit PRIVATE -Os -ffunction-sections -fdata-sections)
 
-# ── libsumo onboard (verify-only subset) ────────────────────────────
-# checkpoint 1 only needs validator.c + policy.c.
-# decryptor.c pulls in <openssl/evp.h>, decompressor.c pulls in
-# <zstd.h>, orchestrator.c pulls in OpenSSL too — those land when we
-# add the encrypted/compressed paths in checkpoints 2 & 3.
+# ── libzstd (decoder-only, minified) ────────────────────────────────
+# Build only the decompressor + common bits libsumo's decompressor.c
+# needs. ~50 KB code with -Os; the ZSTD_LIB_MINIFY family of defines
+# trims away bench/legacy/dict-builder paths.
+set(ZSTD_DIR ${SUMO_RP2350_DIR}/3rdparty/zstd/lib)
+add_library(zstd_dec STATIC
+    ${ZSTD_DIR}/common/debug.c
+    ${ZSTD_DIR}/common/entropy_common.c
+    ${ZSTD_DIR}/common/error_private.c
+    ${ZSTD_DIR}/common/fse_decompress.c
+    ${ZSTD_DIR}/common/pool.c
+    ${ZSTD_DIR}/common/threading.c
+    ${ZSTD_DIR}/common/xxhash.c
+    ${ZSTD_DIR}/common/zstd_common.c
+    ${ZSTD_DIR}/decompress/huf_decompress.c
+    ${ZSTD_DIR}/decompress/zstd_ddict.c
+    ${ZSTD_DIR}/decompress/zstd_decompress_block.c
+    ${ZSTD_DIR}/decompress/zstd_decompress.c)
+target_include_directories(zstd_dec PUBLIC ${ZSTD_DIR})
+target_compile_definitions(zstd_dec PRIVATE
+    ZSTD_LIB_MINIFY=1
+    ZSTD_LEGACY_SUPPORT=0
+    ZSTD_LIB_DICTBUILDER=0
+    ZSTD_LIB_DEPRECATED=0
+    ZSTD_NO_INLINE=1
+    ZSTD_DISABLE_ASM=1
+    ZSTD_NOBENCH=1
+    XXH_NO_INLINE_HINTS=1)
+target_compile_options(zstd_dec PRIVATE -Os -ffunction-sections -fdata-sections)
+
+# ── libsumo onboard (verify + decompress subset) ─────────────────────
+# Pulls in decompressor.c too now (checkpoint 3). decryptor.c +
+# orchestrator.c still left out — they require OpenSSL EVP, and this
+# example uses our own PSA-backed decryptor instead.
 add_library(sumo_onboard STATIC
     ${LIBSUMO_DIR}/onboard/src/validator.c
-    ${LIBSUMO_DIR}/onboard/src/policy.c)
+    ${LIBSUMO_DIR}/onboard/src/policy.c
+    ${LIBSUMO_DIR}/onboard/src/decompressor.c)
 target_include_directories(sumo_onboard
     PUBLIC  ${LIBSUMO_DIR}/onboard/include
     PRIVATE ${LIBSUMO_DIR}/onboard/src)
-target_link_libraries(sumo_onboard PUBLIC csuit)
+target_link_libraries(sumo_onboard PUBLIC csuit zstd_dec)
+# Match the producer's --zstd-window-log. zstd's library default of 27
+# (128 MB) lazy-allocates a window buffer that OOM-panics RP2350; even
+# its level-3 default of ~19 (512 KB) is too big. 10 (1 KB window) is
+# what we tell sumo-tool to compress firmware with for this target,
+# and what the decoder is allowed to honor at most.
+target_compile_definitions(sumo_onboard PRIVATE
+    SUMO_DECOMPRESSOR_WINDOW_LOG_MAX=10)
 target_compile_options(sumo_onboard PRIVATE -Os -ffunction-sections -fdata-sections)
 
 # ── sumo-rp2350 binding ─────────────────────────────────────────────

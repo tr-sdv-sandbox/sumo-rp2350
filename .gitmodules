@@ -1,3 +1,6 @@
 [submodule "3rdparty/littlefs"]
 	path = 3rdparty/littlefs
 	url = https://github.com/littlefs-project/littlefs.git
+[submodule "3rdparty/zstd"]
+	path = 3rdparty/zstd
+	url = https://github.com/facebook/zstd.git
