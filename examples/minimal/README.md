@@ -7,24 +7,25 @@ hardware — not to demonstrate a full OTA flow.
 
 ## Build
 
-The example expects:
-- `arm-none-eabi-gcc` toolchain installed
-- `PICO_SDK_PATH` exported (pointing at a checked-out pico-sdk tree)
-- libsumo's onboard 3rdparty deps (libcsuit, t_cose, qcbor, libzstd,
-  and a crypto backend) cross-built for Cortex-M33 and visible to
-  CMake. **This is the outstanding bring-up work.** Without it the
-  example links but `sumo_validator_create` etc. won't have working
-  crypto on-device.
-
-Once those are in place:
+Run the top-level `setup-deps.sh` once first to install the
+cross-toolchain, build picotool, and pin the Pico SDK
+(see `../../README.md`). Then:
 
 ```sh
+source ../../env.sh                     # exports PICO_SDK_PATH
 cd examples/minimal
 mkdir build && cd build
 cmake -DPICO_BOARD=pico2 ..
 make -j
 picotool load -f sumo_rp2350_minimal.uf2
 ```
+
+Note: libsumo's onboard 3rdparty deps (libcsuit, t_cose, qcbor,
+libzstd, and a crypto backend like mbedTLS) still need to be
+cross-built for Cortex-M33 — that's the outstanding bring-up work.
+Until then the example links but `sumo_validator_create` etc.
+won't have working crypto on-device. The kv layer (mount, read,
+write) does work without those.
 
 Open the USB-CDC console (115200 baud, board enumerates as `/dev/ttyACMx`):
 

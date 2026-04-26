@@ -57,6 +57,22 @@ hardware-target bindings are independent consumers.
 └── sumo-workspace/        ← host-side stack meta-repo (separate concern)
 ```
 
+## First-time setup
+
+Run once on a fresh machine — installs the cross-toolchain, builds
+picotool from source, and pins the Pico SDK to a known-good release
+under `~/.local/share/pico-sdk/<version>/` so multiple Pico projects
+can share it:
+
+```sh
+./setup-deps.sh
+source ./env.sh   # exports PICO_SDK_PATH
+```
+
+Versions are pinned at the top of `setup-deps.sh`. The script is
+idempotent — re-run it any time to refresh the env helper or pick up
+a bumped pin.
+
 ## Building
 
 `sumo-rp2350` is consumed from a Pico-SDK app:
