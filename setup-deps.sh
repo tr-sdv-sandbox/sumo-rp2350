@@ -98,6 +98,25 @@ if [ "$need_picotool" = 1 ]; then
     )
 fi
 
+# ── picotool udev rules ────────────────────────────────────────────
+# picotool talks to the picoboot USB interface (BOOTSEL mode). Without
+# a udev rule that grants the logged-in user access to the device,
+# every `picotool` invocation needs sudo. The rules file ships in the
+# picotool source tree.
+RULES_SRC="$PICOTOOL_SRC/udev/60-picotool.rules"
+RULES_DST="/etc/udev/rules.d/60-picotool.rules"
+if [ -f "$RULES_SRC" ]; then
+    if [ ! -f "$RULES_DST" ] || ! sudo cmp -s "$RULES_SRC" "$RULES_DST"; then
+        echo "==> Installing udev rule for picoboot ($RULES_DST)"
+        sudo install -m 0644 "$RULES_SRC" "$RULES_DST"
+        sudo udevadm control --reload
+        sudo udevadm trigger
+        echo "    re-plug a connected RP-series board for the rule to take effect."
+    else
+        echo "==> picotool udev rule already installed"
+    fi
+fi
+
 # ── Project-local env helper ───────────────────────────────────────
 cat > "$ENV_FILE" <<EOF
 # source ./env.sh  before building this project
