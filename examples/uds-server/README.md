@@ -75,14 +75,21 @@ request prints a `UDS req: ...` / `UDS rsp: ...` line.
 
 ## Bench loop with a Linux host
 
-You need a USB-CAN adapter on your Linux box (CANable, PEAK-USB,
-SocketCAN-compatible, etc). Wire H↔H, L↔L, plus one termination
-resistor at the far end.
+You need a USB-CAN adapter on your Linux box (CANable Pro / other
+gs_usb-class works out of the box; PEAK-USB / Kvaser need their
+own setup). Wire H↔H, L↔L, plus one termination resistor at the
+far end (the Waveshare board has a selectable 120 Ω terminator).
 
 ```
-sudo ip link set can0 up type can bitrate 500000
-cd host && pip install -r requirements.txt
+cd host
+sudo ./setup-can.sh                # bring up can0 @ 500 kbps
+pip install -r requirements.txt
 python3 tester.py can0
+```
+
+To tear down:
+```
+sudo ./setup-can.sh can0 down
 ```
 
 Expected:
