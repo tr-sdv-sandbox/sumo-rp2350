@@ -61,9 +61,16 @@ static int bd_read(const struct lfs_config *c, lfs_block_t block,
 {
     sumo_rp2350_t *r = c->context;
     uint32_t addr = r->cfg.fs_offset + block * c->block_size + off;
-    /* Flash is XIP-mapped at XIP_BASE — direct memcpy from there is
-     * the fastest path and avoids touching the QSPI command queue. */
-    memcpy(buffer, (const uint8_t *)(XIP_BASE + addr), size);
+    /* Read via the no-translate XIP window (0x1C000000) so partition-
+     * mapped boots still see the full physical flash. With a partition
+     * table loaded the bootrom maps only the active App-* partition at
+     * XIP_BASE (0x10000000); reading our LittleFS-KV slot at 0x3F0000
+     * via XIP_BASE would hit unmapped virtual space and bus-fault.
+     * The no-translate window addresses physical flash 1:1 and has
+     * the cache disabled (slightly slower but always correct). */
+    memcpy(buffer,
+           (const uint8_t *)(XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE + addr),
+           size);
     return 0;
 }
 

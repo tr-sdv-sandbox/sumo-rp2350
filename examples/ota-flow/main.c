@@ -132,10 +132,15 @@ static const uint8_t kKek[16] = {
 
 /* ── Flash layout (matches examples/minimal). 4 MB Waveshare board. */
 static const sumo_rp2350_config_t kFlashCfg = {
-    /* Matches partition_table.json: A at 0x100000+1MB, B at
-     * 0x200000+1MB, kv at 0x3F0000+64KB. */
+    /* littlefs region: 16 KB at 0x3F0000. The partition table's
+     * LittleFS-KV slot reserves 64 KB but littlefs only needs 16 KB
+     * for our policy keys + boot counter; reformatting an existing
+     * 16 KB volume to 64 KB block_count would re-mount-fail and
+     * potentially deadlock if the format step hits an erase that
+     * straddles the running image. The extra 48 KB of the slot is
+     * just unused. */
     .fs_offset     = 0x003F0000,
-    .fs_size       = 0x00010000,
+    .fs_size       = 0x00004000,
     .slot_a_offset = 0x00100000,
     .slot_a_size   = 0x00100000,
     .slot_b_offset = 0x00200000,
