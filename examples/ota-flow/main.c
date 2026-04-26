@@ -48,6 +48,7 @@
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
+#include "pico/bootrom.h"        /* rom_get_boot_info, rom_explicit_buy */
 #include "pico/stdlib.h"
 #include "psa/crypto.h"
 
@@ -166,12 +167,28 @@ typedef enum {
     OTA_NEED_ENVELOPE,
     OTA_NEED_PAYLOAD,
     OTA_VALIDATING,
-    OTA_OK,
+    OTA_STAGED,           /* envelope+payload validated, awaiting activate */
+    OTA_TRIAL,            /* booted into new image, awaiting commit */
+    OTA_OK,               /* committed (or never trialed) */
     OTA_FAILED,
 } ota_state_t;
 
-/* Indexed by ota_state_t for the 0xF200 DID. */
-static const char s_state_chars[] = "IPRHEDVKX";
+/* Indexed by ota_state_t for the 0xF200 DID:
+ *   I idle  P preparing  R ready  H header  E envelope  D download
+ *   V validating  S staged  T trial  K ok  X failed                  */
+static const char s_state_chars[] = "IPRHEDVSTKX";
+
+/* Multi-boot trial: orchestrator must call commit before the
+ * counter exceeds this. Each cold boot in PENDING state ticks the
+ * counter; expiry triggers self-rollback. Tunable per-fleet via
+ * app_config.h; default of 5 covers a typical "drove home, drove
+ * to work, never reached the orchestrator" sequence. */
+#ifndef MAX_TRIAL_BOOTS
+#define MAX_TRIAL_BOOTS 5
+#endif
+
+#define TRIAL_NORMAL  0
+#define TRIAL_PENDING 1
 
 static volatile ota_state_t s_ota_state;
 
@@ -200,6 +217,12 @@ static uint8_t                s_page_buf[PAGE_SIZE];
 static uint32_t               s_page_filled;
 
 static uint8_t                s_pt_sha256[32];
+
+/* Last boot type — exposed at DID 0xF204 so the orchestrator can
+ * confirm a Flash-Update Boot actually happened (vs the bootrom
+ * having silently kept booting the old slot). 'N' = normal,
+ * 'F' = flash-update (TBYB), 'B' = BOOTSEL, '?' = unknown. */
+static char                   s_last_boot_type = '?';
 
 static void ota_pipeline_free(void) {
     if (s_dec) { psa_decryptor_free(s_dec);  s_dec = NULL; }
@@ -541,16 +564,61 @@ static bool ota_exit_cb(const uds_request_t *req, uds_response_t *resp) {
     s_ota_state = OTA_VALIDATING;
     int rc = finalize_pipeline();
     ota_pipeline_free();
-    s_ota_state = (rc == 0) ? OTA_OK : OTA_FAILED;
+    /* On success the image is in the inactive slot but NOT yet
+     * activated — orchestrator must explicitly trigger
+     * RoutineControl(activate) when it's ready. State `S` (staged)
+     * marks the awaiting-activate condition, `K` only after a
+     * successful trial+commit. */
+    s_ota_state = (rc == 0) ? OTA_STAGED : OTA_FAILED;
 
     resp->len = 1;
     resp->data[0] = 0x77;
     return true;
 }
 
-/* ── 0x31 RoutineControl handler (start eraseMemory + results) ──── */
-
+/* ── 0x31 RoutineControl handler ───────────────────────────────────
+ *
+ *  0xFF00 (eraseMemory)        — prepare phase, erase inactive slot
+ *  0xF001 (vendor: activate)   — STAGED → FUB-reboot to new slot in TBYB
+ *  0xF002 (vendor: commit)     — TRIAL → clear trial_state, mark OK
+ *  0xF003 (vendor: rollback)   — TRIAL → invalidate own image_def + reboot
+ */
 #define ROUTINE_ERASE_MEMORY 0xFF00
+#define ROUTINE_ACTIVATE     0xF001
+#define ROUTINE_COMMIT       0xF002
+#define ROUTINE_ROLLBACK     0xF003
+
+/* Self-rollback: erase the first sector of OUR slot's flash so the
+ * bootrom can't find a valid IMAGE_DEF here on the next reset and
+ * picks the surviving (older) slot instead. Caller must reboot
+ * immediately afterwards. */
+static void invalidate_own_image_def(void) {
+    boot_info_t bi;
+    if (!rom_get_boot_info(&bi) || bi.partition < 0) {
+        return;  /* unpartitioned — can't self-rollback */
+    }
+    /* Partition index 0 = App-A (0x100000), 1 = App-B (0x200000). */
+    uint32_t flash_off =
+        (bi.partition == 0) ? kFlashCfg.slot_a_offset
+                            : kFlashCfg.slot_b_offset;
+    uint32_t saved = save_and_disable_interrupts();
+    flash_range_erase(flash_off, FLASH_SECTOR_SIZE);
+    restore_interrupts(saved);
+}
+
+/* Set trial_state in littlefs. Used by activate (PENDING) and
+ * commit (NORMAL). Returns 0 on success. */
+static int trial_state_write(int pending) {
+    sumo_storage_ops_t *st = sumo_rp2350_storage_ops(s_platform);
+    if (!st) return -1;
+    if (st->write_u64("trial_state",
+                       pending ? TRIAL_PENDING : TRIAL_NORMAL,
+                       st->ctx) != 0) return -1;
+    if (pending) {
+        if (st->write_u64("trial_boots", 0, st->ctx) != 0) return -1;
+    }
+    return 0;
+}
 
 static void app_routine_control(const uds_request_t *req,
                                 uds_response_t *resp) {
@@ -562,39 +630,105 @@ static void app_routine_control(const uds_request_t *req,
     uint8_t  sub        = req->data[0];
     uint16_t routine_id = ((uint16_t)req->data[1] << 8) | req->data[2];
 
-    if (routine_id != ROUTINE_ERASE_MEMORY) {
+    if (routine_id != ROUTINE_ERASE_MEMORY &&
+        routine_id != ROUTINE_ACTIVATE     &&
+        routine_id != ROUTINE_COMMIT       &&
+        routine_id != ROUTINE_ROLLBACK) {
         resp->len = 3; resp->data[0] = 0x7F;
         resp->data[1] = req->sid; resp->data[2] = 0x31; /* OOR */
         return;
     }
 
-    switch (sub) {
-    case 0x01:  /* startRoutine — kick off erase, return immediately. */
+    /* Build the standard "positive RC response" header before any
+     * routine-specific tail. SID 0x71 + sub + 2-byte routine ID. */
+    resp->data[0] = 0x71;
+    resp->data[1] = sub;
+    resp->data[2] = (uint8_t)(routine_id >> 8);
+    resp->data[3] = (uint8_t)(routine_id & 0xFF);
+    resp->len = 4;
+
+    /* sub 0x03 (requestResults) is uniform: append current state. */
+    if (sub == 0x03) {
+        resp->data[4] = (uint8_t)s_state_chars[s_ota_state];
+        resp->len = 5;
+        return;
+    }
+
+    if (sub != 0x01) {
+        resp->len = 3; resp->data[0] = 0x7F;
+        resp->data[1] = req->sid; resp->data[2] = 0x12; /* sub-fn NS */
+        return;
+    }
+
+    /* sub 0x01 = startRoutine. Per-ID behavior: */
+    switch (routine_id) {
+    case ROUTINE_ERASE_MEMORY:
         ota_reset();
         s_ota_state      = OTA_PREPARING;
         s_prepare_offset = 0;
         printf("OTA prepare: erasing %u-byte inactive slot\n",
                (unsigned)sumo_rp2350_inactive_size(s_platform));
         fflush(stdout);
-        resp->len = 4;
-        resp->data[0] = 0x71;        /* RoutineControl positive resp */
-        resp->data[1] = 0x01;
-        resp->data[2] = (uint8_t)(routine_id >> 8);
-        resp->data[3] = (uint8_t)(routine_id & 0xFF);
         return;
-    case 0x03: { /* requestRoutineResults — return current state. */
-        resp->len = 5;
-        resp->data[0] = 0x71;
-        resp->data[1] = 0x03;
-        resp->data[2] = (uint8_t)(routine_id >> 8);
-        resp->data[3] = (uint8_t)(routine_id & 0xFF);
-        resp->data[4] = (uint8_t)s_state_chars[s_ota_state];
+
+    case ROUTINE_ACTIVATE:
+        /* precondition: state == STAGED. Set trial_state=PENDING in
+         * littlefs (so the new image's boot path knows it's on
+         * trial), then FUB-reboot to the inactive slot. */
+        if (s_ota_state != OTA_STAGED) {
+            resp->len = 3; resp->data[0] = 0x7F;
+            resp->data[1] = req->sid; resp->data[2] = 0x22;
+            return;
+        }
+        if (trial_state_write(1) != 0) {
+            resp->len = 3; resp->data[0] = 0x7F;
+            resp->data[1] = req->sid; resp->data[2] = 0x72;
+            return;
+        }
+        /* The inactive-slot base is what we just wrote into during
+         * TransferData. After we send this response, we reboot via
+         * FUB so the bootrom prefers that slot. The 1 s delay gives
+         * ISO-TP time to flush the response onto the bus before we
+         * yank the cores. */
+        printf("activate: FUB to slot at 0x%08x in 1s\n",
+               (unsigned)sumo_rp2350_inactive_offset(s_platform));
+        fflush(stdout);
+        sleep_ms(1000);
+        rom_reboot(BOOT_TYPE_FLASH_UPDATE, 0,
+                   XIP_BASE + sumo_rp2350_inactive_offset(s_platform), 0);
+        /* unreached on success; bootrom resets immediately */
+        while (1) tight_loop_contents();
+
+    case ROUTINE_COMMIT:
+        /* precondition: state == TRIAL. Clear trial_state. */
+        if (s_ota_state != OTA_TRIAL) {
+            resp->len = 3; resp->data[0] = 0x7F;
+            resp->data[1] = req->sid; resp->data[2] = 0x22;
+            return;
+        }
+        if (trial_state_write(0) != 0) {
+            resp->len = 3; resp->data[0] = 0x7F;
+            resp->data[1] = req->sid; resp->data[2] = 0x72;
+            return;
+        }
+        s_ota_state = OTA_OK;
+        printf("commit: trial -> committed\n");
+        fflush(stdout);
         return;
-    }
-    default:
-        resp->len = 3; resp->data[0] = 0x7F;
-        resp->data[1] = req->sid; resp->data[2] = 0x12; /* sub-fn NS */
-        return;
+
+    case ROUTINE_ROLLBACK:
+        /* precondition: state == TRIAL. Erase IMAGE_DEF + reboot. */
+        if (s_ota_state != OTA_TRIAL) {
+            resp->len = 3; resp->data[0] = 0x7F;
+            resp->data[1] = req->sid; resp->data[2] = 0x22;
+            return;
+        }
+        printf("rollback: invalidating IMAGE_DEF + reboot in 1s\n");
+        fflush(stdout);
+        sleep_ms(1000);
+        invalidate_own_image_def();
+        rom_reboot(BOOT_TYPE_NORMAL, 0, 0, 0);
+        while (1) tight_loop_contents();
     }
 }
 
@@ -621,6 +755,20 @@ static bool ota_did_read(uint16_t did,
         out[2] = (uint8_t)(s_ota_consumed >> 16);
         out[3] = (uint8_t)(s_ota_consumed >> 24);
         *out_len = 4;
+        return true;
+    case 0xF203: { /* trial_boots — uint8 (0..MAX_TRIAL_BOOTS) */
+        if (max_len < 1) { *out_nrc = 0x14; return false; }
+        sumo_storage_ops_t *st = sumo_rp2350_storage_ops(s_platform);
+        uint64_t v = 0;
+        if (st) (void)st->read_u64("trial_boots", &v, st->ctx);
+        out[0] = (uint8_t)(v & 0xFF);
+        *out_len = 1;
+        return true;
+    }
+    case 0xF204:  /* last boot type — N/F/B/? — see s_last_boot_type */
+        if (max_len < 1) { *out_nrc = 0x14; return false; }
+        out[0] = (uint8_t)s_last_boot_type;
+        *out_len = 1;
         return true;
     default:
         return false;
@@ -702,6 +850,46 @@ int main(void) {
 
     STAGE(1, "stdio + led ok");
 
+    /* Tier-1 → tier-2 handoff. If the bootrom flagged this boot as
+     * a Flash-Update Boot (TBYB), consume the single-shot trial
+     * flag here. We've made it past LED + stdio init — far enough
+     * that the bootrom's "image bricks before reaching userspace"
+     * safety net would have already missed catching us. From here
+     * on, the app-level trial counter (in littlefs) protects
+     * against multi-boot trial failures across ignition cycles. */
+    {
+        boot_info_t bi;
+        if (rom_get_boot_info(&bi)) {
+            /* Mask off any high-bit flags (chained / signed / etc) and
+             * just match the lower bits. */
+            uint8_t bt = bi.boot_type & 0x7f;
+            switch (bt) {
+            case BOOT_TYPE_NORMAL:        s_last_boot_type = 'N'; break;
+            case BOOT_TYPE_FLASH_UPDATE:  s_last_boot_type = 'F'; break;
+            case BOOT_TYPE_BOOTSEL:       s_last_boot_type = 'B'; break;
+            default:                      s_last_boot_type = '?'; break;
+            }
+            printf("boot_type=%c (raw=0x%02x)\n",
+                   s_last_boot_type, bi.boot_type);
+            fflush(stdout);
+            if (s_last_boot_type == 'F') {
+                /* Consume the bootrom's TBYB flag. Without this call,
+                 * a power-cycle in trial would auto-revert to the old
+                 * slot — too aggressive for fleet OTA where the
+                 * orchestrator may take many ignition cycles to
+                 * confirm health. The 4 KB scratch buffer is needed
+                 * for the bootrom's flag-clearing dance. */
+                static uint8_t buy_buf[4096] __attribute__((aligned(4)));
+                int rc = rom_explicit_buy(buy_buf, sizeof(buy_buf));
+                printf("rom_explicit_buy rc=%d\n", rc);
+                fflush(stdout);
+            }
+        } else {
+            printf("rom_get_boot_info failed\n");
+            fflush(stdout);
+        }
+    }
+
     if (psa_crypto_init() != PSA_SUCCESS) {
         printf("psa_crypto_init FAILED\n"); fflush(stdout);
         while (1) blink_n(1, 30, 970);
@@ -719,6 +907,60 @@ int main(void) {
         printf("sumo_rp2350_create FAILED\n"); fflush(stdout);
         while (1) blink_n(3, 30, 970);
     }
+
+    /* Sync the platform's `active_slot` byte to whichever partition the
+     * bootrom actually picked, so `sumo_rp2350_inactive_offset` returns
+     * the OTHER slot for the next OTA's TransferData writes. Without
+     * this, OTA cycle 2 would overwrite the running image.
+     *
+     * Reads bi.partition from the bootrom (set up during stage 1) and
+     * writes it as the low byte of the active_slot u64 file
+     * (platform_rp2350.c reads only the low byte). */
+    {
+        sumo_storage_ops_t *st = sumo_rp2350_storage_ops(s_platform);
+        boot_info_t bi;
+        if (rom_get_boot_info(&bi) && bi.partition >= 0) {
+            uint8_t my_part = (uint8_t)bi.partition;
+            (void)st->write_u64("active_slot", my_part, st->ctx);
+            printf("active_slot synced to bootrom partition %u\n",
+                   (unsigned)my_part);
+            fflush(stdout);
+        }
+    }
+
+    /* Tier-2 trial counter. We hold the bootrom's commit (we already
+     * called rom_explicit_buy if this was a FUB boot), so the bootrom
+     * won't auto-revert. From here, the orchestrator owns the trial
+     * window — but if it never calls commit/rollback within
+     * MAX_TRIAL_BOOTS cold boots (drove home, drove to work,
+     * orchestrator never reachable), we self-rollback. */
+    {
+        sumo_storage_ops_t *st = sumo_rp2350_storage_ops(s_platform);
+        uint64_t trial_state = TRIAL_NORMAL;
+        (void)st->read_u64("trial_state", &trial_state, st->ctx);
+        if (trial_state == TRIAL_PENDING) {
+            uint64_t trial_boots = 0;
+            (void)st->read_u64("trial_boots", &trial_boots, st->ctx);
+            trial_boots++;
+            printf("trial boot %llu / %u (max)\n",
+                   (unsigned long long)trial_boots,
+                   (unsigned)MAX_TRIAL_BOOTS);
+            fflush(stdout);
+            if (trial_boots > MAX_TRIAL_BOOTS) {
+                printf("trial expired without commit — self-rollback\n");
+                fflush(stdout);
+                /* Don't bother resetting trial_state in our littlefs;
+                 * we're erasing our own image anyway, the new (old)
+                 * slot's littlefs state is what matters. */
+                invalidate_own_image_def();
+                rom_reboot(BOOT_TYPE_NORMAL, 0, 0, 0);
+                while (1) tight_loop_contents();
+            }
+            (void)st->write_u64("trial_boots", trial_boots, st->ctx);
+            s_ota_state = OTA_TRIAL;
+        }
+    }
+
     s_validator = sumo_validator_create(kTrustAnchor, sizeof(kTrustAnchor),
                                          NULL);
     if (!s_validator) {
