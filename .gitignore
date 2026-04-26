@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.elf
+*.uf2
+*.map
+*.bin
+.vscode/
+.idea/
+compile_commands.json
