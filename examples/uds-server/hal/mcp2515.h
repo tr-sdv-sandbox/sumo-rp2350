@@ -13,14 +13,18 @@
 bool mcp2515_init(void);
 
 /**
- * Send a CAN frame.  Tries TXB0 first, then TXB1, TXB2.
- * Returns true if the frame was loaded into a transmit buffer.
+ * Enqueue a CAN frame for transmission. Non-blocking. Frame is loaded
+ * into TXB0 immediately if the chip is idle, otherwise queued in a
+ * software FIFO; the /INT-driven ISR pops the FIFO each time TXB0
+ * finishes transmitting. Returns true if the frame was accepted; false
+ * if the FIFO is full. Single TXB used → wire order = enqueue order.
  */
 bool mcp2515_send(const can_frame_t *frame);
 
 /**
- * Check if a received frame is available (non-blocking).
- * If available, copies it into *frame and returns true.
+ * Pop a received frame from the software FIFO. Non-blocking; the ISR
+ * fills the FIFO from RXB0/RXB1 as frames arrive. Returns true if a
+ * frame was copied into *frame, false if the FIFO is empty.
  */
 bool mcp2515_receive(can_frame_t *frame);
 
@@ -53,5 +57,12 @@ uint8_t mcp2515_read_status(void);
  * Get transmit/receive error counters.
  */
 void mcp2515_get_errors(uint8_t *tec, uint8_t *rec);
+
+/**
+ * Get cumulative TX / RX FIFO drop counts. Drops happen when
+ * mcp2515_send / the ISR can't push a new frame because the FIFO is
+ * full. Useful for diagnostics; non-monotonic across init.
+ */
+void mcp2515_get_drops(uint32_t *tx_drops, uint32_t *rx_drops);
 
 #endif /* MCP2515_H */

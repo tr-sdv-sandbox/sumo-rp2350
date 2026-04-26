@@ -126,10 +126,10 @@ OK — full UDS round-trip succeeded.
 
 | Section | Bytes |
 |---|---|
-| `.text` | 59,632 |
-| `.bss`  | 11,900 |
-| `.bin`  | 53 KB  |
-| `.uf2`  | 105 KB |
+| `.text` | 61,232 |
+| `.bss`  | 12,956 |
+| `.bin`  | 54 KB  |
+| `.uf2`  | 109 KB |
 
 Of that, `uds_tiny::uds + ::store + ::isotp` total ~12 KB after
 `-Os --gc-sections`. The rest is pico-sdk runtime + USB-CDC + the
